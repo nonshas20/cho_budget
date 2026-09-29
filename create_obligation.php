@@ -2,6 +2,7 @@
 // 1. START SESSION
 if (session_status() === PHP_SESSION_NONE) { session_start(); }
 require 'includes/db_connect.php';
+require_once 'includes/procurement_bridge.php';
 
 // HELPER: Generate Acronym
 function getFundAcronym($name) {
@@ -116,11 +117,34 @@ if (isset($_POST['save_obligation'])) {
 
         if($total_amount <= 0) throw new Exception("Total amount must be greater than zero.");
 
-        // 4. INSERT OBLIGATION HEADER
+        // 4. INSERT OBLIGATION HEADER (WITH PROCUREMENT DOCUMENT CODE)
         $is_ca = isset($_POST['is_cash_advance']) ? 1 : 0; 
-        
-        $sql_head = "INSERT INTO obligations (transaction_ref, budget_bucket_id, charging_period, obligation_date, ppa_name, particulars, amount, status, is_cash_advance, bonded_officer, program_unit, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())";
-        $pdo->prepare($sql_head)->execute([$trx_ref, $primary_bucket_id, $period, $target_date, $ppa_name, $partic, $total_amount, $status, $is_ca, $officer, $unit]);
+        $doc_code = strtoupper(trim($_POST['document_code'] ?? ''));
+        ensure_obligations_has_document_code_column($pdo);
+
+        // GUARD: Ensure procurement code is not already linked to another obligation
+        if (!empty($doc_code)) {
+            $alreadyLinked = check_procurement_code_already_linked($pdo, $doc_code);
+            if ($alreadyLinked) {
+                throw new Exception("Procurement Code {$doc_code} is ALREADY linked to Obligation {$alreadyLinked['transaction_ref']} (#{$alreadyLinked['id']}: {$alreadyLinked['ppa_name']}). Each procurement project can only be linked to one obligation.");
+            }
+
+            // GUARD: Ensure procurement project is FINALIZED in CHO Procurement (not Draft or Cancelled)
+            $procState = check_procurement_project_state($pdo, $doc_code);
+            if ($procState) {
+                if ($procState['status'] === 'CANCELLED') {
+                    throw new Exception("Procurement Code {$doc_code} ({$procState['title']}) is CANCELLED in CHO Procurement and cannot be linked.");
+                }
+                if ((int)$procState['is_locked'] === 0) {
+                    throw new Exception("Procurement Code {$doc_code} ({$procState['title']}) is currently in DRAFT status in CHO Procurement. It must be Finalized before linking.");
+                }
+            }
+        }
+
+        $initial_routing = !empty($doc_code) ? "STAGE 1: SUBMISSION OF REQUISITION TO CHO\r\n\r\n" . $doc_code : null;
+
+        $sql_head = "INSERT INTO obligations (transaction_ref, document_code, budget_bucket_id, charging_period, obligation_date, ppa_name, particulars, amount, status, is_cash_advance, bonded_officer, program_unit, status_routing, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())";
+        $pdo->prepare($sql_head)->execute([$trx_ref, ($doc_code ?: null), $primary_bucket_id, $period, $target_date, $ppa_name, $partic, $total_amount, $status, $is_ca, $officer, $unit, $initial_routing]);
         $obligation_id = $pdo->lastInsertId();
 
         // 5. INSERT CHARGE ITEMS
@@ -129,9 +153,25 @@ if (isset($_POST['save_obligation'])) {
             $stmt_item->execute([$obligation_id, $item['li_id'], $item['b_id'], $item['amt']]);
         }
 
+        // 6. IF LINKED TO PROCUREMENT, INITIALIZE 18-STAGE TRACKING & LOG DIARY
+        if (!empty($doc_code)) {
+            $pdo->prepare("INSERT INTO routing_history (obligation_id, user_name, status, created_at) VALUES (?, ?, ?, NOW())")
+                ->execute([$obligation_id, $_SESSION['username'], "LINKED TO PROCUREMENT DOCUMENT: {$doc_code} (18-Stage Routing Slip Active)"]);
+            
+            try {
+                get_linked_procurement_project($pdo, [
+                    'id' => $obligation_id,
+                    'document_code' => $doc_code,
+                    'ppa_name' => $ppa_name,
+                    'obligation_date' => $target_date,
+                    'fund_name' => $fund_name ?? 'General Fund'
+                ]);
+            } catch (\Throwable $e) {}
+        }
+
         $pdo->commit();
-        log_activity($pdo, $_SESSION['user_id'], $_SESSION['username'], 'CREATE', "Created PPA $trx_ref");
-        $success_msg = "Successfully created PPA <strong>$trx_ref</strong> (Status: " . ucfirst($status) . ").$status_msg";
+        log_activity($pdo, $_SESSION['user_id'], $_SESSION['username'], 'CREATE', "Created PPA $trx_ref" . (!empty($doc_code) ? " (Linked: $doc_code)" : ""));
+        $success_msg = "Successfully created PPA <strong>$trx_ref</strong>" . (!empty($doc_code) ? " linked to Procurement Code <span class='badge font-monospace text-white' style='background-color:#004253'>$doc_code</span>" : "") . " (Status: " . ucfirst($status) . ").$status_msg <a href='edit_obligation.php?id=$obligation_id' class='btn btn-sm btn-outline-success ms-2 fw-bold'><i class='bi bi-folder2-open me-1'></i>Manage Routing Slip</a>";
 
     } catch (Exception $e) { 
         $pdo->rollBack();
@@ -143,6 +183,18 @@ $current_year = date('Y');
 $years = $pdo->query("SELECT * FROM fiscal_years ORDER BY year DESC")->fetchAll();
 $funds = $pdo->query("SELECT * FROM fund_sources")->fetchAll();
 $units = ["Admin Division", "Public Health", "Epidemiology", "Laboratory", "Pharmacy", "Sanitation", "BHW Unit", "Finance Unit"];
+
+// Procurement Bridge Linkage Data (Unlinked projects only)
+ensure_obligations_has_document_code_column($pdo);
+$prefill_doc_code = strtoupper(trim($_GET['doc_code'] ?? ''));
+$proc_projects = [];
+$already_linked_codes = [];
+$draft_proc_codes = [];
+try {
+    $proc_projects = get_available_unlinked_procurement_projects($pdo);
+    $already_linked_codes = $pdo->query("SELECT o.document_code, o.transaction_ref, o.ppa_name FROM cho_budget_db.obligations o WHERE o.document_code IS NOT NULL AND o.document_code != ''")->fetchAll(PDO::FETCH_ASSOC);
+    $draft_proc_codes = $pdo->query("SELECT document_code, title, is_locked, status FROM cho_procurement_db.requisition_projects WHERE document_code IS NOT NULL AND (is_locked = 0 OR status = 'CANCELLED')")->fetchAll(PDO::FETCH_ASSOC);
+} catch (\Throwable $e) {}
 ?>
 
 <div class="container mt-4" style="max-width: 900px;">
@@ -187,6 +239,65 @@ $units = ["Admin Division", "Public Health", "Epidemiology", "Laboratory", "Phar
                 <div class="mb-3">
                     <label class="form-label fw-bold small text-muted">Particulars / Description</label>
                     <textarea name="particulars" class="form-control" rows="2" placeholder="Specific details..."></textarea>
+                </div>
+
+                <!-- CHO PROCUREMENT TRACKING LINK (OPTIONAL) -->
+                <div class="card border mb-3 shadow-2xs" style="border-top: 3px solid #004253 !important; background-color: #f8fafc;">
+                    <div class="card-body p-3">
+                        <div class="d-flex justify-content-between align-items-center mb-1">
+                            <label class="form-label fw-bold small text-dark mb-0 d-flex align-items-center gap-1.5">
+                                <i class="bi bi-folder-symlink-fill text-success"></i>
+                                <span>Link to CHO Procurement Tracking (Optional)</span>
+                            </label>
+                            <span class="badge bg-light text-muted border font-monospace" style="font-size: 0.68rem;">18-Stage Slip Bridge</span>
+                        </div>
+                        <p class="text-muted small mb-2" style="font-size: 0.75rem;">
+                            Bind this obligation to a procurement tracking code (e.g. <code>PROC-2026-FIO0MY</code>) to stick the 18 physical routing stages and enable release forwarding.
+                        </p>
+
+                        <!-- Select from unlinked dropdown -->
+                        <div class="mb-2">
+                            <label class="form-label small text-muted mb-1 fw-semibold">Quick Select from Available Unlinked Procurement:</label>
+                            <select id="proc_doc_select" class="form-select form-select-sm" onchange="onProcSelectChange(this.value)">
+                                <option value="">-- Click here to select an available procurement document (<?= count($proc_projects); ?> available) --</option>
+                                <?php foreach($proc_projects as $p): ?>
+                                    <option value="<?= htmlspecialchars($p['document_code']); ?>" <?= ($prefill_doc_code === $p['document_code']) ? 'selected' : ''; ?>>
+                                        <?= htmlspecialchars($p['document_code']); ?> — <?= htmlspecialchars($p['title']); ?> (FY <?= $p['target_year']; ?> &bull; <?= htmlspecialchars($p['fund_source']); ?>)
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="small text-muted" style="font-size: 0.70rem;">OR enter/search document code manually:</span>
+                        </div>
+
+                        <div class="input-group input-group-sm">
+                            <span class="input-group-text bg-white font-monospace text-muted fw-bold">#</span>
+                            <input 
+                                type="text" 
+                                name="document_code" 
+                                id="proc_doc_code_input" 
+                                class="form-control font-monospace fw-bold" 
+                                placeholder="PROC-2026-XXXXXX" 
+                                value="<?= htmlspecialchars($prefill_doc_code); ?>" 
+                                list="procDocCodes" 
+                                autocomplete="off"
+                                onclick="if(this.showPicker) try{this.showPicker();}catch(e){}"
+                                oninput="this.value = this.value.toUpperCase(); syncSelectWithInput(this.value); validateProcCode(this.value);"
+                            >
+                            <button type="button" class="btn btn-outline-secondary" onclick="clearProcCode();">Clear</button>
+                        </div>
+
+                        <datalist id="procDocCodes">
+                            <?php foreach($proc_projects as $p): ?>
+                                <option value="<?= htmlspecialchars($p['document_code']); ?>"><?= htmlspecialchars($p['title']); ?> (FY <?= $p['target_year']; ?> - <?= htmlspecialchars($p['fund_source']); ?>)</option>
+                            <?php endforeach; ?>
+                        </datalist>
+
+                        <!-- Live Matched Project Preview -->
+                        <div id="proc_code_preview" class="mt-2" style="display: none;"></div>
+                    </div>
                 </div>
 
                 <div class="mb-3">
@@ -347,7 +458,169 @@ document.getElementById('status_select').addEventListener('change', function() {
 function formatAmount(input) { let v=input.value.replace(/[^0-9.]/g,''),p=v.split('.');p[0]=p[0].replace(/\B(?=(\d{3})+(?!\d))/g,",");input.value=p.join('.')+(p.length>1&&p[1].length>2?'':''); }
 function toggleBonded() { const chk=document.getElementById('bonded_check'); const inp=document.getElementById('officer_input'); inp.disabled=!chk.checked; if(!chk.checked) inp.value=''; }
 
-document.addEventListener('DOMContentLoaded', fetchItems);
+// Procurement Linking Validation & Live Preview
+const procProjectsList = <?= json_encode($proc_projects); ?>;
+const alreadyLinkedCodes = <?= json_encode($already_linked_codes); ?>;
+const draftProcCodes = <?= json_encode($draft_proc_codes); ?>;
+
+function onProcSelectChange(val) {
+    const inp = document.getElementById('proc_doc_code_input');
+    if (inp) {
+        inp.value = val;
+        validateProcCode(val);
+    }
+}
+
+function syncSelectWithInput(val) {
+    const sel = document.getElementById('proc_doc_select');
+    if (sel) {
+        sel.value = val;
+    }
+}
+
+function clearProcCode() {
+    const inp = document.getElementById('proc_doc_code_input');
+    const sel = document.getElementById('proc_doc_select');
+    if (inp) inp.value = '';
+    if (sel) sel.value = '';
+    validateProcCode('');
+}
+
+function validateProcCode(code) {
+    const previewDiv = document.getElementById('proc_code_preview');
+    const saveBtn = document.getElementById('saveBtn');
+    if (!previewDiv) return;
+    const cleanCode = code ? code.trim().toUpperCase() : '';
+
+    if (!cleanCode) {
+        previewDiv.style.display = 'none';
+        previewDiv.innerHTML = '';
+        if (saveBtn) {
+            saveBtn.disabled = false;
+            saveBtn.title = '';
+        }
+        return;
+    }
+
+    // 1. Guard Check: Is this code already linked to an existing obligation?
+    const matchedLinked = alreadyLinkedCodes.find(item => item.document_code && item.document_code.toUpperCase() === cleanCode);
+    if (matchedLinked) {
+        if (saveBtn) {
+            saveBtn.disabled = true;
+            saveBtn.title = `Double-Link Blocked: Code ${cleanCode} is already bound to obligation ${matchedLinked.transaction_ref}`;
+        }
+        previewDiv.style.display = 'block';
+        previewDiv.innerHTML = `
+            <div class="p-2.5 rounded border border-danger bg-danger-subtle text-danger d-flex align-items-start gap-2 shadow-2xs">
+                <i class="bi bi-x-circle-fill text-danger fs-5 mt-0.5"></i>
+                <div class="flex-grow-1 min-w-0">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <strong class="text-danger small">ALREADY LINKED &bull; DOUBLE-LINK FORBIDDEN</strong>
+                        <span class="badge bg-danger" style="font-size: 0.65rem;">BLOCKED</span>
+                    </div>
+                    <div class="small mt-1 text-danger-emphasis" style="font-size: 0.76rem;">
+                        Procurement Code <strong>${cleanCode}</strong> is already linked to Obligation <strong>${matchedLinked.transaction_ref}</strong> (${matchedLinked.ppa_name}).
+                    </div>
+                    <div class="small text-muted mt-0.5" style="font-size: 0.70rem;">
+                        Each procurement document can only be linked to one obligation. Please select an unlinked project from the dropdown.
+                    </div>
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    // 2. Guard Check: Is this project still in DRAFT or CANCELLED in CHO Procurement?
+    const matchedDraft = draftProcCodes.find(item => item.document_code && item.document_code.toUpperCase() === cleanCode);
+    if (matchedDraft) {
+        if (saveBtn) {
+            saveBtn.disabled = true;
+            saveBtn.title = matchedDraft.status === 'CANCELLED' 
+                ? `Blocked: Project ${cleanCode} is CANCELLED`
+                : `Blocked: Project ${cleanCode} is in DRAFT status`;
+        }
+        previewDiv.style.display = 'block';
+
+        if (matchedDraft.status === 'CANCELLED') {
+            previewDiv.innerHTML = `
+                <div class="p-2.5 rounded border border-danger bg-danger-subtle text-danger d-flex align-items-start gap-2 shadow-2xs">
+                    <i class="bi bi-x-circle-fill text-danger fs-5 mt-0.5"></i>
+                    <div class="flex-grow-1 min-w-0">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <strong class="text-danger small">PROJECT CANCELLED IN PROCUREMENT</strong>
+                            <span class="badge bg-danger" style="font-size: 0.65rem;">CANCELLED</span>
+                        </div>
+                        <div class="small mt-1 text-danger-emphasis" style="font-size: 0.76rem;">
+                            Project <strong>${matchedDraft.title}</strong> (${cleanCode}) has been cancelled and cannot be linked to budget obligations.
+                        </div>
+                    </div>
+                </div>
+            `;
+        } else {
+            previewDiv.innerHTML = `
+                <div class="p-2.5 rounded border border-warning bg-warning-subtle text-warning-emphasis d-flex align-items-start gap-2 shadow-2xs">
+                    <i class="bi bi-exclamation-triangle-fill text-warning fs-5 mt-0.5"></i>
+                    <div class="flex-grow-1 min-w-0">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <strong class="text-dark small">PROJECT IN DRAFT &bull; NOT YET FINALIZED</strong>
+                            <span class="badge bg-warning text-dark" style="font-size: 0.65rem;">DRAFT</span>
+                        </div>
+                        <div class="small mt-1 text-dark" style="font-size: 0.76rem;">
+                            Project <strong>${matchedDraft.title}</strong> (${cleanCode}) is still being prepared in the Requisition Cart.
+                        </div>
+                        <div class="small text-muted mt-0.5" style="font-size: 0.70rem;">
+                            It must be finalized & tracked in CHO Procurement before it can be linked to an obligation.
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        return;
+    }
+
+    // If not blocked, make sure save button is enabled
+    if (saveBtn) {
+        saveBtn.disabled = false;
+        saveBtn.title = '';
+    }
+
+    // 2. Is this code in available unlinked procurement projects?
+    const matched = procProjectsList.find(p => p.document_code && p.document_code.toUpperCase() === cleanCode);
+    if (matched) {
+        previewDiv.style.display = 'block';
+        previewDiv.innerHTML = `
+            <div class="p-2.5 rounded border border-success bg-white d-flex align-items-start gap-2 shadow-2xs">
+                <i class="bi bi-check-circle-fill text-success fs-6 mt-0.5"></i>
+                <div class="flex-grow-1 min-w-0">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <strong class="text-dark small text-truncate d-block">${matched.title}</strong>
+                        <span class="badge bg-success" style="font-size: 0.65rem;">AVAILABLE FOR LINKING</span>
+                    </div>
+                    <div class="text-muted small" style="font-size: 0.72rem;">
+                        <span>FY ${matched.target_year}</span> &bull; <span>${matched.fund_source}</span> &bull; <span class="font-monospace text-dark">${matched.document_code}</span>
+                    </div>
+                </div>
+            </div>
+        `;
+    } else {
+        previewDiv.style.display = 'block';
+        previewDiv.innerHTML = `
+            <div class="p-2 rounded border border-info bg-white d-flex align-items-center gap-2">
+                <i class="bi bi-info-circle text-info"></i>
+                <span class="text-muted small" style="font-size: 0.72rem;">Custom code: A new 18-stage physical tracking project will be registered for <strong>${cleanCode}</strong> upon saving.</span>
+            </div>
+        `;
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    fetchItems();
+    const input = document.getElementById('proc_doc_code_input');
+    if (input && input.value) {
+        syncSelectWithInput(input.value);
+        validateProcCode(input.value);
+    }
+});
 </script>
 
 <?php require 'includes/footer.php'; ?>

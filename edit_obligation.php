@@ -2,6 +2,7 @@
 // 1. START SESSION
 if (session_status() === PHP_SESSION_NONE) { session_start(); }
 require 'includes/db_connect.php';
+require_once 'includes/procurement_bridge.php';
 
 $success_msg = "";
 $error_msg   = "";
@@ -256,18 +257,95 @@ if (isset($_POST['save_changes'])) {
     } catch (Exception $e) { $pdo->rollBack(); $error_msg = "Error: " . $e->getMessage(); }
 }
 
-// ROUTING
+// ROUTING & PROCUREMENT BRIDGE
 if (isset($_POST['update_routing'])) {
     $new_status = trim($_POST['status_routing']);
     if (!empty($new_status)) {
         $pdo->prepare("UPDATE obligations SET status_routing = ? WHERE id = ?")->execute([$new_status, $id]);
         $pdo->prepare("INSERT INTO routing_history (obligation_id, user_name, status) VALUES (?, ?, ?)")->execute([$id, $_SESSION['username'], $new_status]);
-        $success_msg = "Routing updated.";
+        $success_msg = "Routing movement recorded in Document Diary.";
+        $stmt->execute([$id]);
+        $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
     }
 }
+
+// 18-STAGE PROCUREMENT FORWARD HANDLER
+if (isset($_POST['forward_procurement_stage'])) {
+    $stage_order  = (int)($_POST['stage_order'] ?? 0);
+    $proc_proj_id = (int)($_POST['procurement_project_id'] ?? 0);
+    $rel_date     = !empty($_POST['release_date']) ? $_POST['release_date'] : date('Y-m-d');
+    $rel_remarks  = trim($_POST['release_remarks'] ?? '');
+    $actor        = $_SESSION['username'] ?? 'ADMIN';
+
+    if ($stage_order > 0 && $proc_proj_id > 0) {
+        $res = forward_procurement_stage_from_budget($pdo, (int)$id, $proc_proj_id, $stage_order, $rel_date, $rel_remarks, $actor);
+        if ($res['success']) {
+            $success_msg = $res['message'];
+            // Re-fetch base_data so status_routing and timestamps are fresh
+            $stmt->execute([$id]);
+            $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
+        } else {
+            $error_msg = $res['message'];
+        }
+    }
+}
+
+// LINK PROCUREMENT TRACKING CODE
+if (isset($_POST['link_procurement_code'])) {
+    $manual_code = strtoupper(trim($_POST['manual_document_code'] ?? ''));
+    if (!empty($manual_code)) {
+        // Backend Guard: prevent linking if code is already bound to another obligation
+        $alreadyLinked = check_procurement_code_already_linked($pdo, $manual_code, (int)$id);
+        if ($alreadyLinked) {
+            $error_msg = "Double-Link Blocked: Procurement Code '{$manual_code}' is already linked to Obligation {$alreadyLinked['transaction_ref']} (#{$alreadyLinked['id']}: {$alreadyLinked['ppa_name']}). Each procurement project can only be linked to one obligation.";
+        } else {
+            // Backend Guard: check if project is DRAFT or CANCELLED in CHO Procurement
+            $procState = check_procurement_project_state($pdo, $manual_code);
+            if ($procState && $procState['status'] === 'CANCELLED') {
+                $error_msg = "Cannot link: Procurement Project {$manual_code} is CANCELLED in CHO Procurement.";
+            } elseif ($procState && (int)$procState['is_locked'] === 0) {
+                $error_msg = "Cannot link: Procurement Project {$manual_code} ({$procState['title']}) is currently in DRAFT status in CHO Procurement. It must be Finalized before linking.";
+            } else {
+                ensure_obligations_has_document_code_column($pdo);
+                $pdo->prepare("UPDATE obligations SET document_code = ? WHERE id = ?")->execute([$manual_code, $id]);
+                if (empty($base_data['status_routing'])) {
+                    $initRouting = "STAGE 1: SUBMISSION OF REQUISITION TO CHO\r\n\r\n" . $manual_code;
+                    $pdo->prepare("UPDATE obligations SET status_routing = ? WHERE id = ?")->execute([$initRouting, $id]);
+                }
+                $success_msg = "Linked to Procurement Tracking Code: " . htmlspecialchars($manual_code);
+                $stmt->execute([$id]);
+                $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
+            }
+        }
+    }
+}
+
+// UNLINK PROCUREMENT TRACKING CODE
+if (isset($_POST['unlink_procurement_code'])) {
+    ensure_obligations_has_document_code_column($pdo);
+    $old_code = $base_data['document_code'] ?? '';
+    $pdo->prepare("UPDATE obligations SET document_code = NULL WHERE id = ?")->execute([$id]);
+    $success_msg = "Unlinked procurement code " . htmlspecialchars($old_code) . " from this obligation.";
+    $stmt->execute([$id]);
+    $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
 $stmt_hist = $pdo->prepare("SELECT * FROM routing_history WHERE obligation_id = ? ORDER BY created_at DESC");
 $stmt_hist->execute([$id]);
 $history = $stmt_hist->fetchAll();
+
+// Fetch linked procurement tracking and 18-stage status
+$proc_tracking = get_linked_procurement_project($pdo, $base_data);
+
+// Fetch unlinked procurement projects and already-linked codes for edit validation & dropdown
+$available_unlinked_projects = [];
+$already_linked_codes_for_edit = [];
+$draft_proc_codes_for_edit = [];
+try {
+    $available_unlinked_projects = get_available_unlinked_procurement_projects($pdo, (int)$id);
+    $already_linked_codes_for_edit = $pdo->query("SELECT o.document_code, o.transaction_ref, o.ppa_name FROM cho_budget_db.obligations o WHERE o.document_code IS NOT NULL AND o.document_code != '' AND o.id != " . (int)$id)->fetchAll(PDO::FETCH_ASSOC);
+    $draft_proc_codes_for_edit = $pdo->query("SELECT document_code, title, is_locked, status FROM cho_procurement_db.requisition_projects WHERE document_code IS NOT NULL AND (is_locked = 0 OR status = 'CANCELLED')")->fetchAll(PDO::FETCH_ASSOC);
+} catch (\Throwable $e) {}
 ?>
 
 <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
@@ -421,6 +499,253 @@ $history = $stmt_hist->fetchAll();
         </div>
 
         <div class="col-lg-4">
+            <!-- 18-STAGE PHYSICAL PROCUREMENT ROUTING SLIP -->
+            <div class="card shadow-sm border-0 mb-4" style="border-top: 4px solid #004253 !important;">
+                <div class="card-header bg-white py-2.5 border-bottom d-flex justify-content-between align-items-center">
+                    <div>
+                        <div class="text-uppercase small fw-bold text-muted" style="font-size: 0.68rem; letter-spacing: 0.5px;">Physical Routing Slip</div>
+                        <h6 class="fw-bold text-dark mb-0 d-flex align-items-center gap-1">
+                            <i class="bi bi-folder2-open text-success me-1"></i>18-Stage Tracking
+                        </h6>
+                    </div>
+                    <?php if ($proc_tracking && !empty($proc_tracking['document_code'])): ?>
+                        <div class="d-flex align-items-center gap-1.5">
+                            <span class="badge font-monospace" style="background-color: #004253; color: #fff; font-size: 0.72rem;">
+                                <?= htmlspecialchars($proc_tracking['document_code']); ?>
+                            </span>
+                            <form method="POST" class="d-inline" onsubmit="return confirm('Are you sure you want to unlink <?= htmlspecialchars($proc_tracking['document_code']); ?> from this obligation?');">
+                                <button type="submit" name="unlink_procurement_code" class="btn btn-outline-danger btn-xs py-0 px-1.5" style="font-size: 0.65rem;" title="Unlink this procurement code">
+                                    <i class="bi bi-x-circle me-1"></i>Unlink
+                                </button>
+                            </form>
+                        </div>
+                    <?php else: ?>
+                        <span class="badge bg-secondary font-monospace" style="font-size: 0.72rem;">Unlinked</span>
+                    <?php endif; ?>
+                </div>
+
+                <div class="card-body bg-white p-3">
+                    <?php if ($proc_tracking && $proc_tracking['project']): ?>
+                        <?php 
+                            $curr_st = $proc_tracking['current_stage']; 
+                            $is_done = ($proc_tracking['overall_status'] === 'COMPLETED');
+                            $is_draft = !empty($proc_tracking['is_draft']);
+                            $is_cancelled = !empty($proc_tracking['is_cancelled']);
+                        ?>
+
+                        <?php if ($is_cancelled): ?>
+                            <!-- Cancelled Alert Banner -->
+                            <div class="alert alert-danger p-2.5 small mb-3 d-flex align-items-center gap-2 shadow-2xs">
+                                <i class="bi bi-x-circle-fill fs-5 text-danger"></i>
+                                <div>
+                                    <strong class="text-danger">PROCUREMENT PROJECT CANCELLED</strong>
+                                    <div class="text-muted" style="font-size: 0.72rem;">This linked project was marked as CANCELLED in CHO Procurement. Stage advancement is suspended.</div>
+                                </div>
+                            </div>
+                        <?php elseif ($is_draft): ?>
+                            <!-- Reverted to Draft Alert Banner -->
+                            <div class="alert alert-warning p-2.5 small mb-3 d-flex align-items-center gap-2 shadow-2xs">
+                                <i class="bi bi-exclamation-triangle-fill fs-5 text-warning-emphasis"></i>
+                                <div>
+                                    <strong class="text-dark">PROJECT IN DRAFT (REVERTED IN BUILDER)</strong>
+                                    <div class="text-muted" style="font-size: 0.72rem;">This project is currently unlocked in the Requisition Cart. Routing forward actions are paused until re-finalized.</div>
+                                </div>
+                            </div>
+                        <?php endif; ?>
+                        
+                        <!-- Active Stage Highlight -->
+                        <div class="p-3 rounded border mb-3 <?= $is_done ? 'bg-light border-success' : ($is_cancelled ? 'bg-light border-danger' : ($is_draft ? 'bg-light border-warning' : 'bg-light border-teal')) ?>" style="border-left: 4px solid <?= $is_done ? '#198754' : ($is_cancelled ? '#dc3545' : ($is_draft ? '#ffc107' : '#004253')); ?> !important;">
+                            <div class="d-flex justify-content-between align-items-center mb-1">
+                                <span class="badge <?= $is_done ? 'bg-success' : ($is_cancelled ? 'bg-danger' : ($is_draft ? 'bg-warning text-dark' : 'bg-primary')) ?> text-uppercase" style="font-size: 0.65rem;">
+                                    <?= $is_done ? 'ALL 18 STAGES COMPLETED' : ($is_cancelled ? 'CANCELLED' : ($is_draft ? 'PROJECT IN DRAFT' : 'CURRENT STAGE #' . ($curr_st['stage_order'] ?? 1))); ?>
+                                </span>
+                                <?php if (!$is_done && !$is_cancelled && !$is_draft): ?>
+                                    <?php if ($proc_tracking['is_delayed']): ?>
+                                        <span class="badge bg-danger text-white" style="font-size: 0.65rem;">
+                                            <i class="bi bi-exclamation-triangle-fill me-1"></i><?= $proc_tracking['days_in_stage']; ?>d DELAYED
+                                        </span>
+                                    <?php else: ?>
+                                        <span class="badge bg-white text-muted border" style="font-size: 0.65rem;">
+                                            <i class="bi bi-clock me-1"></i><?= $proc_tracking['days_in_stage']; ?>d at desk
+                                        </span>
+                                    <?php endif; ?>
+                                <?php endif; ?>
+                            </div>
+
+                            <div class="fw-bold text-dark text-uppercase small mt-1" style="font-size: 0.85rem;">
+                                <?= htmlspecialchars($curr_st['stage_name'] ?? 'Completed'); ?>
+                            </div>
+
+                            <div class="text-muted small mt-1" style="font-size: 0.72rem;">
+                                <strong>Office:</strong> <span class="text-dark fw-semibold"><?= htmlspecialchars($curr_st['department'] ?? 'CHO'); ?></span> &bull; 
+                                <strong>Phase:</strong> <?= htmlspecialchars($curr_st['phase'] ?? 'Requisition'); ?>
+                            </div>
+                        </div>
+
+                        <!-- Forward / Release Action Form (for Admin / Authorized Staff) -->
+                        <?php if (!$is_done && !$is_draft && !$is_cancelled): ?>
+                            <fieldset <?= $routing_lock; ?> class="border rounded p-3 bg-white mb-3 shadow-2xs">
+                                <legend class="float-none w-auto px-2 small fw-bold text-uppercase text-muted" style="font-size: 0.68rem;">
+                                    <i class="bi bi-send-check text-success me-1"></i>Release &amp; Forward to Next Stage
+                                </legend>
+                                <form method="POST">
+                                    <input type="hidden" name="stage_order" value="<?= (int)($curr_st['stage_order'] ?? 1); ?>">
+                                    <input type="hidden" name="procurement_project_id" value="<?= (int)$proc_tracking['project']['id']; ?>">
+
+                                    <div class="mb-2">
+                                        <label class="form-label small fw-bold text-muted mb-1" style="font-size: 0.72rem;">Date Released / Transmitted</label>
+                                        <input type="date" name="release_date" class="form-control form-control-sm" value="<?= date('Y-m-d'); ?>" required>
+                                    </div>
+
+                                    <div class="mb-2">
+                                        <label class="form-label small fw-bold text-muted mb-1" style="font-size: 0.72rem;">Transmittal Notes / Remarks (Optional)</label>
+                                        <input type="text" name="release_remarks" class="form-control form-control-sm" placeholder="e.g. Endorsed with signed memo to next desk">
+                                    </div>
+
+                                    <button type="submit" name="forward_procurement_stage" class="btn btn-sm btn-success fw-bold w-100 shadow-sm mt-1">
+                                        <i class="bi bi-arrow-right-circle me-1"></i> Release &amp; Forward to Stage <?= min(18, ($curr_st['stage_order'] ?? 1) + 1); ?>
+                                    </button>
+                                </form>
+                            </fieldset>
+                        <?php else: ?>
+                            <div class="alert alert-success py-2 px-3 small fw-bold mb-3 d-flex align-items-center gap-2">
+                                <i class="bi bi-check-circle-fill text-success fs-5"></i>
+                                <span>All 18 routing stages have been successfully completed!</span>
+                            </div>
+                        <?php endif; ?>
+
+                        <!-- Progress Bar -->
+                        <div class="mb-3">
+                            <div class="d-flex justify-content-between align-items-center small mb-1" style="font-size: 0.72rem;">
+                                <span class="fw-bold text-muted">Routing Milestones</span>
+                                <span class="fw-bold text-dark font-monospace"><?= $proc_tracking['completed_count']; ?> / 18 (<?= $proc_tracking['progress_percent']; ?>%)</span>
+                            </div>
+                            <div class="progress" style="height: 6px;">
+                                <div class="progress-bar bg-success" role="progressbar" style="width: <?= $proc_tracking['progress_percent']; ?>%;" aria-valuenow="<?= $proc_tracking['progress_percent']; ?>" aria-valuemin="0" aria-valuemax="100"></div>
+                            </div>
+                        </div>
+
+                        <!-- Collapsible 18 Milestones Checklist -->
+                        <div class="accordion accordion-flush border rounded mb-3" id="accordionStages">
+                            <div class="accordion-item">
+                                <h2 class="accordion-header" id="flush-headingStages">
+                                    <button class="accordion-button collapsed py-2 px-3 small fw-bold text-dark bg-light" type="button" data-bs-toggle="collapse" data-bs-target="#flush-collapseStages" aria-expanded="false" aria-controls="flush-collapseStages" style="font-size: 0.72rem;">
+                                        <i class="bi bi-list-check me-2 text-primary"></i> View All 18 Milestones
+                                    </button>
+                                </h2>
+                                <div id="flush-collapseStages" class="accordion-collapse collapse" aria-labelledby="flush-headingStages" data-bs-parent="#accordionStages">
+                                    <div class="accordion-body p-0 overflow-auto" style="max-height: 250px;">
+                                        <ul class="list-group list-group-flush small" style="font-size: 0.72rem;">
+                                            <?php foreach ($proc_tracking['stages'] as $st): ?>
+                                                <?php 
+                                                    $is_st_done = ($st['status'] === 'COMPLETED');
+                                                    $is_st_curr = ($curr_st && $curr_st['id'] == $st['id'] && !$is_done);
+                                                ?>
+                                                <li class="list-group-item py-1.5 px-2.5 d-flex align-items-start gap-2 <?= $is_st_curr ? 'bg-light text-primary fw-bold' : '' ?>">
+                                                    <div class="mt-0.5">
+                                                        <?php if ($is_st_done): ?>
+                                                            <i class="bi bi-check-circle-fill text-success"></i>
+                                                        <?php elseif ($is_st_curr): ?>
+                                                            <span class="spinner-grow spinner-grow-sm text-primary" style="width: 0.75rem; height: 0.75rem;" role="status"></span>
+                                                        <?php else: ?>
+                                                            <i class="bi bi-circle text-muted"></i>
+                                                        <?php endif; ?>
+                                                    </div>
+                                                    <div class="flex-grow-1 min-w-0">
+                                                        <div class="d-flex justify-content-between align-items-center">
+                                                            <span class="text-truncate <?= $is_st_done ? 'text-decoration-line-through text-muted' : ($is_st_curr ? 'text-dark fw-bold' : 'text-secondary') ?>">
+                                                                <?= $st['stage_order']; ?>. <?= htmlspecialchars($st['stage_name']); ?>
+                                                            </span>
+                                                        </div>
+                                                        <div class="text-muted d-flex justify-content-between align-items-center" style="font-size: 0.65rem;">
+                                                            <span><?= htmlspecialchars($st['department']); ?></span>
+                                                            <?php if (!empty($st['date_released'])): ?>
+                                                                <span class="text-success"><?= date('m/d/y', strtotime($st['date_released'])); ?></span>
+                                                            <?php elseif (!empty($st['date_submitted'])): ?>
+                                                                <span class="text-primary"><?= date('m/d/y', strtotime($st['date_submitted'])); ?></span>
+                                                            <?php endif; ?>
+                                                        </div>
+                                                    </div>
+                                                </li>
+                                            <?php endforeach; ?>
+                                        </ul>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Cross-Link to CHO Procurement System -->
+                        <div>
+                            <a href="http://127.0.0.1:8000/tracking?project=<?= $proc_tracking['project']['id']; ?>" target="_blank" class="btn btn-sm btn-outline-secondary w-100 fw-bold d-flex align-items-center justify-content-center gap-1.5" style="font-size: 0.72rem;">
+                                <i class="bi bi-box-arrow-up-right"></i>
+                                <span>Open in CHO Procurement Workstation</span>
+                            </a>
+                        </div>
+
+                    <?php else: ?>
+                        <!-- Link Procurement Document Form -->
+                        <div class="p-3 bg-light rounded border">
+                            <div class="d-flex align-items-center gap-2 mb-2 pb-2 border-bottom">
+                                <div class="bg-primary bg-opacity-10 text-primary p-2 rounded-circle d-flex align-items-center justify-content-center" style="width: 32px; height: 32px;">
+                                    <i class="bi bi-folder-symlink-fill"></i>
+                                </div>
+                                <div class="text-start">
+                                    <div class="fw-bold small text-dark">Link to CHO Procurement Tracking</div>
+                                    <div class="text-muted small" style="font-size: 0.72rem;">Select an available procurement document or search code.</div>
+                                </div>
+                            </div>
+                            
+                            <form method="POST" id="editLinkForm">
+                                <div class="mb-2 text-start">
+                                    <label class="form-label small fw-bold text-muted mb-1" style="font-size: 0.75rem;">
+                                        <i class="bi bi-list-check me-1 text-primary"></i>Available Unlinked Documents (<?= count($available_unlinked_projects); ?>)
+                                    </label>
+                                    <select id="edit_proc_select" class="form-select form-select-sm" onchange="onEditSelectChange(this.value)">
+                                        <option value="">-- Click to select an available procurement document --</option>
+                                        <?php foreach($available_unlinked_projects as $p): ?>
+                                            <option value="<?= htmlspecialchars($p['document_code']); ?>">
+                                                <?= htmlspecialchars($p['document_code']); ?> — <?= htmlspecialchars($p['title']); ?> (FY <?= $p['target_year']; ?> &bull; <?= htmlspecialchars($p['fund_source']); ?>)
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+
+                                <div class="mb-2 text-start">
+                                    <label class="form-label small text-muted mb-1 fw-semibold" style="font-size: 0.72rem;">Or search / enter document code:</label>
+                                    <div class="input-group input-group-sm">
+                                        <span class="input-group-text bg-white font-monospace text-muted fw-bold">#</span>
+                                        <input 
+                                            type="text" 
+                                            name="manual_document_code" 
+                                            id="edit_manual_doc_code" 
+                                            class="form-control font-monospace fw-bold" 
+                                            placeholder="PROC-2026-XXXXXX" 
+                                            list="editProcDocCodes" 
+                                            autocomplete="off"
+                                            onclick="if(this.showPicker) try{this.showPicker();}catch(e){}"
+                                            oninput="this.value = this.value.toUpperCase(); syncEditSelectWithInput(this.value); validateEditProcCode(this.value);"
+                                        >
+                                        <button class="btn btn-primary fw-bold" type="submit" name="link_procurement_code" id="editLinkSubmitBtn" disabled>
+                                            <i class="bi bi-link-45deg me-1"></i>Link
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <datalist id="editProcDocCodes">
+                                    <?php foreach($available_unlinked_projects as $p): ?>
+                                        <option value="<?= htmlspecialchars($p['document_code']); ?>"><?= htmlspecialchars($p['title']); ?> (FY <?= $p['target_year']; ?> - <?= htmlspecialchars($p['fund_source']); ?>)</option>
+                                    <?php endforeach; ?>
+                                </datalist>
+
+                                <!-- Live Validation & Project Preview for Edit View -->
+                                <div id="edit_proc_preview" class="mt-2 text-start" style="display: none;"></div>
+                            </form>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+
+            <!-- ROUTING MANAGER & DOCUMENT DIARY (PRESERVED) -->
             <div class="card shadow-sm border-0 mb-4"><div class="card-header bg-info text-white fw-bold"><i class="bi bi-signpost-split me-2"></i>Routing Manager</div><div class="card-body bg-white"><fieldset <?php echo $routing_lock; ?>><form method="POST"><div class="mb-3"><label class="form-label small fw-bold text-muted">Update Status</label><textarea name="status_routing" class="form-control border-info" rows="2"><?php echo htmlspecialchars($base_data['status_routing'] ?? ''); ?></textarea></div><button type="submit" name="update_routing" class="btn btn-info text-white fw-bold w-100"><i class="bi bi-send-check me-2"></i>Log Movement</button></form></fieldset></div></div>
             <div class="card shadow-sm border-0"><div class="card-header bg-dark text-white fw-bold"><span><i class="bi bi-journal-text me-2"></i>Document Diary</span></div><div class="card-body p-0 overflow-auto" style="max-height: 400px;"><ul class="list-group list-group-flush small"><?php foreach($history as $log): ?><li class="list-group-item"><div class="d-flex justify-content-between"><span class="fw-bold text-primary"><?php echo date('M d, H:i', strtotime($log['created_at'])); ?></span></div><div class="mt-1"><?php echo htmlspecialchars($log['status']); ?></div><div class="text-end text-muted fst-italic" style="font-size: 0.75rem;">by <?php echo htmlspecialchars($log['user_name']); ?></div></li><?php endforeach; ?></ul></div></div>
         </div>
@@ -685,7 +1010,161 @@ function toggleBonded() {
     if(!box.disabled) inp.disabled = !box.checked;
 }
 
-document.addEventListener('DOMContentLoaded', loadData);
+document.addEventListener('DOMContentLoaded', function() {
+    loadData();
+    const editCodeInput = document.getElementById('edit_manual_doc_code');
+    if (editCodeInput && editCodeInput.value) {
+        syncEditSelectWithInput(editCodeInput.value);
+        validateEditProcCode(editCodeInput.value);
+    }
+});
+
+// EDIT PAGE: Procurement Linking Validation & Helpers
+const editAvailableProjects = <?= json_encode($available_unlinked_projects); ?>;
+const editAlreadyLinkedCodes = <?= json_encode($already_linked_codes_for_edit); ?>;
+const editDraftProcCodes = <?= json_encode($draft_proc_codes_for_edit); ?>;
+
+function onEditSelectChange(val) {
+    const inp = document.getElementById('edit_manual_doc_code');
+    if (inp) {
+        inp.value = val;
+        validateEditProcCode(val);
+    }
+}
+
+function syncEditSelectWithInput(val) {
+    const sel = document.getElementById('edit_proc_select');
+    if (sel) {
+        sel.value = val;
+    }
+}
+
+function validateEditProcCode(code) {
+    const previewDiv = document.getElementById('edit_proc_preview');
+    const btn = document.getElementById('editLinkSubmitBtn');
+    if (!previewDiv) return;
+    const cleanCode = code ? code.trim().toUpperCase() : '';
+
+    if (!cleanCode) {
+        previewDiv.style.display = 'none';
+        previewDiv.innerHTML = '';
+        if (btn) btn.disabled = true;
+        return;
+    }
+
+    // 1. Guard check: Is this code already linked to another obligation?
+    const matchedLinked = editAlreadyLinkedCodes.find(item => item.document_code && item.document_code.toUpperCase() === cleanCode);
+    if (matchedLinked) {
+        if (btn) {
+            btn.disabled = true;
+            btn.title = `Double-Link Blocked: Code ${cleanCode} is already bound to obligation ${matchedLinked.transaction_ref}`;
+        }
+        previewDiv.style.display = 'block';
+        previewDiv.innerHTML = `
+            <div class="p-2.5 rounded border border-danger bg-danger-subtle text-danger d-flex align-items-start gap-2 shadow-2xs text-start">
+                <i class="bi bi-x-circle-fill text-danger fs-5 mt-0.5"></i>
+                <div class="flex-grow-1 min-w-0">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <strong class="text-danger small">ALREADY LINKED &bull; FORBIDDEN</strong>
+                        <span class="badge bg-danger" style="font-size: 0.65rem;">BLOCKED</span>
+                    </div>
+                    <div class="small mt-1 text-danger-emphasis" style="font-size: 0.75rem;">
+                        Procurement Code <strong>${cleanCode}</strong> is already linked to Obligation <strong>${matchedLinked.transaction_ref}</strong> (${matchedLinked.ppa_name}).
+                    </div>
+                    <div class="small text-muted mt-0.5" style="font-size: 0.70rem;">
+                        Each procurement project can only be linked to one obligation. Double-linking is not permitted.
+                    </div>
+                </div>
+            </div>
+        `;
+        return;
+    }
+
+    // 2. Guard Check: Is this project still in DRAFT or CANCELLED in CHO Procurement?
+    const matchedDraft = editDraftProcCodes.find(item => item.document_code && item.document_code.toUpperCase() === cleanCode);
+    if (matchedDraft) {
+        if (btn) {
+            btn.disabled = true;
+            btn.title = matchedDraft.status === 'CANCELLED' 
+                ? `Blocked: Project ${cleanCode} is CANCELLED`
+                : `Blocked: Project ${cleanCode} is in DRAFT status`;
+        }
+        previewDiv.style.display = 'block';
+
+        if (matchedDraft.status === 'CANCELLED') {
+            previewDiv.innerHTML = `
+                <div class="p-2.5 rounded border border-danger bg-danger-subtle text-danger d-flex align-items-start gap-2 shadow-2xs text-start">
+                    <i class="bi bi-x-circle-fill text-danger fs-5 mt-0.5"></i>
+                    <div class="flex-grow-1 min-w-0">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <strong class="text-danger small">PROJECT CANCELLED IN PROCUREMENT</strong>
+                            <span class="badge bg-danger" style="font-size: 0.65rem;">CANCELLED</span>
+                        </div>
+                        <div class="small mt-1 text-danger-emphasis" style="font-size: 0.76rem;">
+                            Project <strong>${matchedDraft.title}</strong> (${cleanCode}) has been cancelled and cannot be linked.
+                        </div>
+                    </div>
+                </div>
+            `;
+        } else {
+            previewDiv.innerHTML = `
+                <div class="p-2.5 rounded border border-warning bg-warning-subtle text-warning-emphasis d-flex align-items-start gap-2 shadow-2xs text-start">
+                    <i class="bi bi-exclamation-triangle-fill text-warning fs-5 mt-0.5"></i>
+                    <div class="flex-grow-1 min-w-0">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <strong class="text-dark small">PROJECT IN DRAFT &bull; NOT YET FINALIZED</strong>
+                            <span class="badge bg-warning text-dark" style="font-size: 0.65rem;">DRAFT</span>
+                        </div>
+                        <div class="small mt-1 text-dark" style="font-size: 0.76rem;">
+                            Project <strong>${matchedDraft.title}</strong> (${cleanCode}) is still being prepared in the Requisition Cart.
+                        </div>
+                        <div class="small text-muted mt-0.5" style="font-size: 0.70rem;">
+                            It must be finalized & tracked in CHO Procurement before it can be linked to an obligation.
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+        return;
+    }
+
+    // 2. Check if in available unlinked procurement projects
+    const matched = editAvailableProjects.find(p => p.document_code && p.document_code.toUpperCase() === cleanCode);
+    if (matched) {
+        if (btn) {
+            btn.disabled = false;
+            btn.title = '';
+        }
+        previewDiv.style.display = 'block';
+        previewDiv.innerHTML = `
+            <div class="p-2.5 rounded border border-success bg-white d-flex align-items-start gap-2 shadow-2xs text-start">
+                <i class="bi bi-check-circle-fill text-success fs-6 mt-0.5"></i>
+                <div class="flex-grow-1 min-w-0">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <strong class="text-dark small text-truncate d-block">${matched.title}</strong>
+                        <span class="badge bg-success" style="font-size: 0.65rem;">AVAILABLE</span>
+                    </div>
+                    <div class="text-muted small" style="font-size: 0.72rem;">
+                        <span>FY ${matched.target_year}</span> &bull; <span>${matched.fund_source}</span> &bull; <span class="font-monospace text-dark">${matched.document_code}</span>
+                    </div>
+                </div>
+            </div>
+        `;
+    } else {
+        // Custom new code
+        if (btn) {
+            btn.disabled = false;
+            btn.title = '';
+        }
+        previewDiv.style.display = 'block';
+        previewDiv.innerHTML = `
+            <div class="p-2 rounded border border-info bg-white d-flex align-items-center gap-2 text-start">
+                <i class="bi bi-info-circle text-info"></i>
+                <span class="text-muted small" style="font-size: 0.72rem;">Custom code: A new 18-stage physical tracking project will be initialized for <strong>${cleanCode}</strong>.</span>
+            </div>
+        `;
+    }
+}
 </script>
 
 <?php require 'includes/footer.php'; ?>

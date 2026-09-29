@@ -85,9 +85,9 @@ if (!empty($scan_ref)) {
 
     // 4. TEXT SEARCH
     if (!empty($search_text)) {
-        $where_clauses[] = "(o.ppa_name LIKE ? OR o.particulars LIKE ? OR li.name LIKE ? OR o.program_unit LIKE ? OR o.bonded_officer LIKE ?)";
+        $where_clauses[] = "(o.ppa_name LIKE ? OR o.particulars LIKE ? OR li.name LIKE ? OR o.program_unit LIKE ? OR o.bonded_officer LIKE ? OR o.document_code LIKE ?)";
         $p = "%$search_text%";
-        array_push($params, $p, $p, $p, $p, $p);
+        array_push($params, $p, $p, $p, $p, $p, $p);
     }
 }
 
@@ -95,7 +95,7 @@ $where_sql = implode(" AND ", $where_clauses);
 
 // Main Query with v2.2.0 Subquery Enhancement (Fixed column name to 'status')
 $sql = "SELECT 
-            o.id as obligation_id, o.transaction_ref, o.ppa_name, o.particulars, o.obligation_date, 
+            o.id as obligation_id, o.transaction_ref, o.document_code, o.ppa_name, o.particulars, o.obligation_date, 
             o.charging_period, o.program_unit, o.bonded_officer, o.status,
             ci.amount as planned_amount, ci.disbursed_amount, ci.dv_number,
             li.name as item_name, li.id as item_id,
@@ -125,6 +125,7 @@ foreach ($raw_rows as $row) {
     if (!isset($groups[$key])) {
         $groups[$key] = [
             'ref' => $row['transaction_ref'],
+            'document_code' => $row['document_code'] ?? null,
             'main_id' => $row['obligation_id'],
             'ppa_name' => $row['ppa_name'],
             'particulars' => $row['particulars'],
@@ -322,7 +323,12 @@ function getStatusBadge($status) {
                                     <td class="text-center print-hide-col">
                                         <button class="btn btn-sm btn-light border rounded-circle text-primary <?php echo $btn_collapsed; ?>" type="button" data-bs-toggle="collapse" data-bs-target="#collapse_<?php echo $grp_key; ?>"><i class="bi bi-chevron-down"></i></button>
                                     </td>
-                                    <td class="text-center font-monospace fw-bold text-primary"><?php echo htmlspecialchars($grp['ref']); ?></td>
+                                    <td class="text-center font-monospace fw-bold text-primary">
+                                        <?php echo htmlspecialchars($grp['ref']); ?>
+                                        <?php if (!empty($grp['document_code'])): ?>
+                                            <div class="mt-1"><span class="badge bg-light text-success border font-monospace" style="font-size: 0.65rem;" title="Linked Procurement Tracking Code"><i class="bi bi-link-45deg me-0.5"></i><?php echo htmlspecialchars($grp['document_code']); ?></span></div>
+                                        <?php endif; ?>
+                                    </td>
                                     <td>
                                         <div class="text-uppercase fw-bold text-dark text-truncate-2" title="<?php echo htmlspecialchars($grp['ppa_name']); ?>">
                                             <?php echo htmlspecialchars($grp['ppa_name']); ?>
