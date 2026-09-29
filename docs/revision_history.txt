@@ -1,0 +1,29 @@
+CHO BUDGET MANAGEMENT SYSTEM - REVISION HISTORY
+=============================================
+
+VERSION 3.2 - April 30, 2026
+---------------------------
+Core Focus: Inclusion of Special Fund Pools (GAD, SHF, TF, NTA, DRRMF) and AOP Builder Integration.
+
+[DATABASE UPDATES]
+- Table `budget_ppas`: Added `ppa_code` (VARCHAR 50) for formal tracking and linkage to AOP Builder.
+- Table `budget_ppas`: Added `approved_budget` (DECIMAL 15,2) to store programmatic ceilings.
+- Table `fund_sources`: Registered 'Disaster Risk Reduction and Management Fund' (DRRMF).
+
+[UI/UX ENHANCEMENTS]
+- LHB Programs Registry (lhb_programs.php):
+    - Renamed to "Board and Council Approved Programs".
+    - Added PPA Code field (Manual entry to match external AOP Builder).
+    - Integrated "SAAOB Amount" live summary column reflecting total matrix allocations.
+    - Added fund-based acronym badges and improved layout.
+- Budget Matrix (budget_matrix.php):
+    - Added DRRMF to the Fund Acronym mapping.
+    - Enhanced Program Group Headers to display the PPA Code for better traceability.
+- System Settings (settings.php):
+    - Updated Annual Budget Builder to display PPA Codes in the selection dropdown.
+    - Refined program filtering logic to support non-General Fund pools.
+
+[WORKFLOW & LOGIC]
+- Standardized Macro PPA Decomposition: Enabled composite programs (spanning MOOE and CO) to be registered under a single PPA Code while maintaining individual OOE-based allotment schedules in the matrix.
+- Pure Execution Model: Transitioned from manual ceiling enforcement to a computed summary model, where the SAAOB Amount in the registry is dependent on actual Matrix entries.
+- Tracking Linkage: Established PPA Code as the primary reference key between the Budget System and the external AOP Builder.

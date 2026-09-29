@@ -1,0 +1,19 @@
+# Disable directory listing
+Options -Indexes
+
+# Set default page
+DirectoryIndex index.php login.php
+
+# Deny access to sensitive files
+<FilesMatch "\.(env|log|sql|bak|ini|config)$">
+    Order Allow,Deny
+    Deny from all
+</FilesMatch>
+
+# Deny access to includes directory (prevent direct access)
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    
+    # Block direct access to includes folder
+    RewriteRule ^includes/ - [F,L]
+</IfModule>
