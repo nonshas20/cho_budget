@@ -169,23 +169,49 @@ function bridge_init_project_stages(PDO $pdo, int $projectId): void {
 }
 
 /**
+ * Unlink an obligation from its procurement tracking code.
+ * Sets document_code to NULL, strips legacy PROC- code from status_routing,
+ * and records an unlinking log in routing_history.
+ */
+function unlink_procurement_code_from_obligation(PDO $pdo, int $obligationId, string $username = 'admin'): array {
+    ensure_obligations_has_document_code_column($pdo);
+
+    $stmt = $pdo->prepare("SELECT id, transaction_ref, document_code, status_routing FROM cho_budget_db.obligations WHERE id = ?");
+    $stmt->execute([$obligationId]);
+    $ob = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$ob) {
+        return ['success' => false, 'message' => 'Obligation not found.'];
+    }
+
+    $oldCode = $ob['document_code'] ?? '';
+
+    // Clean any legacy PROC-XXXX from status_routing so it cannot trigger legacy detection
+    $cleanRouting = preg_replace('/(\r?\n)*\bPROC-\d{4}-[A-Z0-9]+\b/i', '', $ob['status_routing'] ?? '');
+    $cleanRouting = trim($cleanRouting);
+
+    $pdo->prepare("UPDATE cho_budget_db.obligations SET document_code = NULL, status_routing = ? WHERE id = ?")
+        ->execute([($cleanRouting !== '' ? $cleanRouting : null), $obligationId]);
+
+    // Record in routing_history (Document Diary)
+    $logMsg = "UNLINKED FROM PROCUREMENT DOCUMENT" . ($oldCode ? ": {$oldCode}" : "");
+    $pdo->prepare("INSERT INTO cho_budget_db.routing_history (obligation_id, user_name, status, created_at) VALUES (?, ?, ?, NOW())")
+        ->execute([$obligationId, $username, $logMsg]);
+
+    return [
+        'success' => true,
+        'message' => "Unlinked procurement code " . ($oldCode ?: "") . " from this obligation.",
+        'old_code' => $oldCode
+    ];
+}
+
+/**
  * Get linked procurement project & routing status for an obligation
  */
 function get_linked_procurement_project(PDO $pdo, array $obligation): ?array {
     ensure_obligations_has_document_code_column($pdo);
 
     $code = !empty($obligation['document_code']) ? trim($obligation['document_code']) : '';
-
-    // Auto-detect code from status_routing or particulars if not set in column
-    if (empty($code) && !empty($obligation['status_routing'])) {
-        if (preg_match('/(PROC-\d{4}-[A-Z0-9]+)/i', $obligation['status_routing'], $matches)) {
-            $code = strtoupper(trim($matches[1]));
-            // Auto backfill column
-            try {
-                $pdo->prepare("UPDATE cho_budget_db.obligations SET document_code = ? WHERE id = ?")->execute([$code, $obligation['id']]);
-            } catch (\Throwable $e) {}
-        }
-    }
 
     if (empty($code)) {
         return null;

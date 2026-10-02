@@ -322,10 +322,15 @@ if (isset($_POST['link_procurement_code'])) {
 
 // UNLINK PROCUREMENT TRACKING CODE
 if (isset($_POST['unlink_procurement_code'])) {
-    ensure_obligations_has_document_code_column($pdo);
-    $old_code = $base_data['document_code'] ?? '';
-    $pdo->prepare("UPDATE obligations SET document_code = NULL WHERE id = ?")->execute([$id]);
-    $success_msg = "Unlinked procurement code " . htmlspecialchars($old_code) . " from this obligation.";
+    $actor = $_SESSION['username'] ?? 'admin';
+    $res = unlink_procurement_code_from_obligation($pdo, (int)$id, $actor);
+    if ($res['success']) {
+        $success_msg = $res['message'];
+    } else {
+        $error_msg = $res['message'];
+    }
+    // Re-fetch base_data cleanly
+    $stmt = $pdo->prepare("SELECT * FROM obligations WHERE id = ?");
     $stmt->execute([$id]);
     $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
 }
