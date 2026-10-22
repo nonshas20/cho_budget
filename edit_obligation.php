@@ -39,9 +39,10 @@ require 'includes/header.php';
 $id = $_GET['id'] ?? null;
 if (!$id) { header("Location: view_obligations.php"); exit; }
 
-$user_role = $_SESSION['role'] ?? 'viewer';
+$user_role = strtolower($_SESSION['role'] ?? 'viewer');
 $is_admin = ($user_role === 'admin');
 $is_viewer = ($user_role === 'viewer');
+$can_edit = in_array($user_role, ['admin', 'encoder']);
 $routing_lock = $is_viewer ? 'disabled' : ''; 
 
 // 1. FETCH DATA
@@ -97,224 +98,240 @@ $actuals_lock = ($is_liquidated || $is_viewer) ? 'readonly' : '';
 // HANDLE SAVE
 // ---------------------------------------------------------
 if (isset($_POST['save_changes'])) {
-    try {
-        $pdo->beginTransaction();
-        $new_status = $_POST['status'];
-        $period     = $_POST['charging_period'];
-        
-        $was_locked = ($_POST['is_locked_mode'] == '1');
-        if ($was_locked) {
-            $bonded_officer = $_POST['hidden_bonded_officer'] ?? null;
-        } else {
-            $bonded_officer = isset($_POST['use_bonded']) ? trim($_POST['bonded_officer']) : null;
-        }
-
-        $status_note = "";
-        $primary_bucket_id = $base_data['budget_bucket_id'];
-
-        if (isset($_POST['bucket_ids'])) {
-            $check_buckets = $_POST['bucket_ids'];
-            $is_period_locked = false;
+    if (!$can_edit) {
+        $error_msg = "Unauthorized: Viewer accounts are read-only and cannot modify obligations.";
+    } else {
+        try {
+            $pdo->beginTransaction();
+            $new_status = $_POST['status'];
+            $period     = $_POST['charging_period'];
             
-            // Grab the very first bucket ID in the list to update the parent record
-            if (!empty($check_buckets[0])) {
-                $primary_bucket_id = $check_buckets[0];
+            $was_locked = ($_POST['is_locked_mode'] == '1');
+            if ($was_locked) {
+                $bonded_officer = $_POST['hidden_bonded_officer'] ?? null;
+            } else {
+                $bonded_officer = isset($_POST['use_bonded']) ? trim($_POST['bonded_officer']) : null;
             }
-            
-            $stmt_check = $pdo->prepare("SELECT * FROM budget_buckets WHERE id = ?");
-            foreach($check_buckets as $bid) {
-                if(!$bid) continue;
-                $stmt_check->execute([$bid]);
-                $b = $stmt_check->fetch(PDO::FETCH_ASSOC);
-                if ($b) {
-                    if ($period == 'q2' && ($b['q2_released'] ?? 1) == 0) $is_period_locked = true;
-                    if ($period == 'q3' && ($b['q3_released'] ?? 1) == 0) $is_period_locked = true;
-                    if ($period == 'q4' && ($b['q4_released'] ?? 1) == 0) $is_period_locked = true;
-                    if ($period == 'sem2' && ($b['sem2_released'] ?? 1) == 0) $is_period_locked = true;
-                    if ($period == 'reserve' && ($b['reserve_released'] ?? 1) == 0) $is_period_locked = true;
+
+            $status_note = "";
+            $primary_bucket_id = $base_data['budget_bucket_id'];
+
+            if (isset($_POST['bucket_ids'])) {
+                $check_buckets = $_POST['bucket_ids'];
+                $is_period_locked = false;
+                
+                // Grab the very first bucket ID in the list to update the parent record
+                if (!empty($check_buckets[0])) {
+                    $primary_bucket_id = $check_buckets[0];
+                }
+                
+                $stmt_check = $pdo->prepare("SELECT * FROM budget_buckets WHERE id = ?");
+                foreach($check_buckets as $bid) {
+                    if(!$bid) continue;
+                    $stmt_check->execute([$bid]);
+                    $b = $stmt_check->fetch(PDO::FETCH_ASSOC);
+                    if ($b) {
+                        if ($period == 'q2' && ($b['q2_released'] ?? 1) == 0) $is_period_locked = true;
+                        if ($period == 'q3' && ($b['q3_released'] ?? 1) == 0) $is_period_locked = true;
+                        if ($period == 'q4' && ($b['q4_released'] ?? 1) == 0) $is_period_locked = true;
+                        if ($period == 'sem2' && ($b['sem2_released'] ?? 1) == 0) $is_period_locked = true;
+                        if ($period == 'reserve' && ($b['reserve_released'] ?? 1) == 0) $is_period_locked = true;
+                    }
+                }
+
+                if ($is_period_locked && in_array($new_status, ['obligated', 'disbursing', 'liquidated'])) {
+                    $new_status = 'pending';
+                    $status_note = " (Forced to Pending due to unreleased funds in $period)";
                 }
             }
 
-            if ($is_period_locked && in_array($new_status, ['obligated', 'disbursing', 'liquidated'])) {
-                $new_status = 'pending';
-                $status_note = " (Forced to Pending due to unreleased funds in $period)";
-            }
-        }
+            // 2. HEADER UPDATE
+            $sql_update = "UPDATE obligations SET ppa_name=?, particulars=?, charging_period=?, bonded_officer=?, program_unit=?, status=?, budget_bucket_id=? WHERE id=?";
+            $pdo->prepare($sql_update)->execute([
+                trim($_POST['ppa_name']),
+                trim($_POST['particulars']),
+                $period,
+                $bonded_officer,
+                trim($_POST['program_unit']),
+                $new_status,
+                $primary_bucket_id,
+                $id
+            ]);
 
-        // 2. HEADER UPDATE
-        $sql_update = "UPDATE obligations SET ppa_name=?, particulars=?, charging_period=?, bonded_officer=?, program_unit=?, status=?, budget_bucket_id=? WHERE id=?";
-        $pdo->prepare($sql_update)->execute([
-            trim($_POST['ppa_name']),
-            trim($_POST['particulars']),
-            $period,
-            $bonded_officer,
-            trim($_POST['program_unit']),
-            $new_status,
-            $primary_bucket_id,
-            $id
-        ]);
-
-        // 3. PLAN UPDATE
-        if (isset($_POST['bucket_ids'])) { 
-            if($trx_ref) {
-                $stmt_sib = $pdo->prepare("SELECT id FROM obligations WHERE transaction_ref = ? AND id != ?");
-                $stmt_sib->execute([$trx_ref, $id]);
-                $siblings = $stmt_sib->fetchAll(PDO::FETCH_COLUMN);
-                if (!empty($siblings)) {
-                    $placeholders = implode(',', array_fill(0, count($siblings), '?'));
-                    $pdo->prepare("UPDATE petty_cash_funds SET obligation_id = ? WHERE obligation_id IN ($placeholders)")->execute(array_merge([$id], $siblings));
-                    $pdo->prepare("DELETE FROM charge_items WHERE obligation_id IN ($placeholders)")->execute($siblings);
-                    $pdo->prepare("DELETE FROM obligations WHERE id IN ($placeholders)")->execute($siblings);
+            // 3. PLAN UPDATE
+            if (isset($_POST['bucket_ids'])) { 
+                if($trx_ref) {
+                    $stmt_sib = $pdo->prepare("SELECT id FROM obligations WHERE transaction_ref = ? AND id != ?");
+                    $stmt_sib->execute([$trx_ref, $id]);
+                    $siblings = $stmt_sib->fetchAll(PDO::FETCH_COLUMN);
+                    if (!empty($siblings)) {
+                        $placeholders = implode(',', array_fill(0, count($siblings), '?'));
+                        $pdo->prepare("UPDATE petty_cash_funds SET obligation_id = ? WHERE obligation_id IN ($placeholders)")->execute(array_merge([$id], $siblings));
+                        $pdo->prepare("DELETE FROM charge_items WHERE obligation_id IN ($placeholders)")->execute($siblings);
+                        $pdo->prepare("DELETE FROM obligations WHERE id IN ($placeholders)")->execute($siblings);
+                    }
                 }
-            }
 
-            $posted_buckets = $_POST['bucket_ids'];
-            $posted_amounts = $_POST['amounts'];
-            $posted_row_ids = $_POST['item_ids'] ?? []; 
-            $kept_ids = [];
-            $total_planned = 0;
-            $stmt_get_li = $pdo->prepare("SELECT line_item_id FROM budget_buckets WHERE id = ?");
+                $posted_buckets = $_POST['bucket_ids'];
+                $posted_amounts = $_POST['amounts'];
+                $posted_row_ids = $_POST['item_ids'] ?? []; 
+                $kept_ids = [];
+                $total_planned = 0;
+                $stmt_get_li = $pdo->prepare("SELECT line_item_id FROM budget_buckets WHERE id = ?");
 
-            foreach($posted_buckets as $idx => $bid) {
-                if(!$bid) continue;
-                $amt = floatval(str_replace(',', '', $posted_amounts[$idx]));
-                $row_id = $posted_row_ids[$idx] ?? 'new';
+                foreach($posted_buckets as $idx => $bid) {
+                    if(!$bid) continue;
+                    $amt = floatval(str_replace(',', '', $posted_amounts[$idx]));
+                    $row_id = $posted_row_ids[$idx] ?? 'new';
 
-                if($amt > 0) {
-                    $stmt_get_li->execute([$bid]);
-                    $li_row = $stmt_get_li->fetch();
-                    if($li_row) {
-                        
-                        // Auto-sync the disbursed amount ONLY if we are still in planning phases
-                        $auto_disburse_amount = in_array($new_status, ['pending', 'obligated']) ? $amt : null;
+                    if($amt > 0) {
+                        $stmt_get_li->execute([$bid]);
+                        $li_row = $stmt_get_li->fetch();
+                        if($li_row) {
+                            
+                            // Auto-sync the disbursed amount ONLY if we are still in planning phases
+                            $auto_disburse_amount = in_array($new_status, ['pending', 'obligated']) ? $amt : null;
 
-                        if (is_numeric($row_id) && $row_id > 0) {
-                            if ($auto_disburse_amount !== null) {
-                                $pdo->prepare("UPDATE charge_items SET line_item_id=?, budget_bucket_id=?, amount=?, disbursed_amount=? WHERE id=?")
-                                    ->execute([$li_row['line_item_id'], $bid, $amt, $auto_disburse_amount, $row_id]);
+                            if (is_numeric($row_id) && $row_id > 0) {
+                                if ($auto_disburse_amount !== null) {
+                                    $pdo->prepare("UPDATE charge_items SET line_item_id=?, budget_bucket_id=?, amount=?, disbursed_amount=? WHERE id=?")
+                                        ->execute([$li_row['line_item_id'], $bid, $amt, $auto_disburse_amount, $row_id]);
+                                } else {
+                                    $pdo->prepare("UPDATE charge_items SET line_item_id=?, budget_bucket_id=?, amount=? WHERE id=?")
+                                        ->execute([$li_row['line_item_id'], $bid, $amt, $row_id]);
+                                }
+                                $kept_ids[] = $row_id;
                             } else {
-                                $pdo->prepare("UPDATE charge_items SET line_item_id=?, budget_bucket_id=?, amount=? WHERE id=?")
-                                    ->execute([$li_row['line_item_id'], $bid, $amt, $row_id]);
+                                $pdo->prepare("INSERT INTO charge_items (obligation_id, line_item_id, budget_bucket_id, amount, disbursed_amount) VALUES (?, ?, ?, ?, ?)")
+                                    ->execute([$id, $li_row['line_item_id'], $bid, $amt, $auto_disburse_amount]);
+                                $kept_ids[] = $pdo->lastInsertId();
                             }
-                            $kept_ids[] = $row_id;
-                        } else {
-                            $pdo->prepare("INSERT INTO charge_items (obligation_id, line_item_id, budget_bucket_id, amount, disbursed_amount) VALUES (?, ?, ?, ?, ?)")
-                                ->execute([$id, $li_row['line_item_id'], $bid, $amt, $auto_disburse_amount]);
-                            $kept_ids[] = $pdo->lastInsertId();
+                            $total_planned += $amt;
                         }
-                        $total_planned += $amt;
+                    }
+                }
+                
+                if (!empty($posted_row_ids)) {
+                    $stmt_all = $pdo->prepare("SELECT id FROM charge_items WHERE obligation_id = ?");
+                    $stmt_all->execute([$id]);
+                    $db_ids = $stmt_all->fetchAll(PDO::FETCH_COLUMN);
+                    $to_delete = array_diff($db_ids, $kept_ids);
+                    if (!empty($to_delete)) {
+                        $in = str_repeat('?,', count($to_delete) - 1) . '?';
+                        $pdo->prepare("DELETE FROM charge_items WHERE id IN ($in)")->execute(array_values($to_delete));
+                    }
+                }
+                $pdo->prepare("UPDATE obligations SET amount = ? WHERE id = ?")->execute([$total_planned, $id]);
+            }
+
+            // 4. ACTUALS UPDATE (THE FIX: Only process this if the PPA is actually in the disbursing stage!)
+            if (in_array($new_status, ['disbursing', 'liquidated']) && isset($_POST['dv_numbers'])) {
+                $dv_ids = $_POST['dv_item_ids'] ?? [];
+                $dv_nums = $_POST['dv_numbers'] ?? [];
+                $dv_amts = $_POST['dv_amounts'] ?? [];
+                $dv_dates = $_POST['dv_dates'] ?? [];
+
+                foreach($dv_ids as $idx => $ci_id) {
+                    $d_num = trim($dv_nums[$idx]);
+                    $d_amt = floatval(str_replace(',', '', $dv_amts[$idx]));
+                    $d_date = !empty($dv_dates[$idx]) ? $dv_dates[$idx] : null;
+                    if ($ci_id) {
+                        $pdo->prepare("UPDATE charge_items SET dv_number=?, disbursed_amount=?, date_disbursed=? WHERE id=?")
+                            ->execute([$d_num, $d_amt, $d_date, $ci_id]);
                     }
                 }
             }
+
+            $pdo->commit();
+            log_activity($pdo, $_SESSION['user_id'], $_SESSION['username'], 'UPDATE', "Updated PPA Ref: " . $trx_ref);
+            $success_msg = "Changes saved successfully." . $status_note;
             
-            if (!empty($posted_row_ids)) {
-                $stmt_all = $pdo->prepare("SELECT id FROM charge_items WHERE obligation_id = ?");
-                $stmt_all->execute([$id]);
-                $db_ids = $stmt_all->fetchAll(PDO::FETCH_COLUMN);
-                $to_delete = array_diff($db_ids, $kept_ids);
-                if (!empty($to_delete)) {
-                    $in = str_repeat('?,', count($to_delete) - 1) . '?';
-                    $pdo->prepare("DELETE FROM charge_items WHERE id IN ($in)")->execute(array_values($to_delete));
-                }
-            }
-            $pdo->prepare("UPDATE obligations SET amount = ? WHERE id = ?")->execute([$total_planned, $id]);
-        }
+            // Refresh Data
+            $stmt->execute([$id]); $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
+            $stmt_items->execute([$id]);
+            $charge_items = $stmt_items->fetchAll(PDO::FETCH_ASSOC);
+            $current_status = $base_data['status'];
+            $is_disbursing = ($current_status === 'disbursing' || $current_status === 'liquidated');
+            $is_liquidated = ($current_status === 'liquidated');
+            $plan_lock = ($is_disbursing || $is_viewer) ? 'readonly' : ''; 
+            $plan_select_class = ($is_disbursing || $is_viewer) ? 'locked-select bg-light' : '';
+            $add_row_hidden = ($is_disbursing || $is_viewer) ? 'display:none;' : '';
+            $actuals_lock = ($is_liquidated || $is_viewer) ? 'readonly' : '';
 
-        // 4. ACTUALS UPDATE (THE FIX: Only process this if the PPA is actually in the disbursing stage!)
-        if (in_array($new_status, ['disbursing', 'liquidated']) && isset($_POST['dv_numbers'])) {
-            $dv_ids = $_POST['dv_item_ids'] ?? [];
-            $dv_nums = $_POST['dv_numbers'] ?? [];
-            $dv_amts = $_POST['dv_amounts'] ?? [];
-            $dv_dates = $_POST['dv_dates'] ?? [];
-
-            foreach($dv_ids as $idx => $ci_id) {
-                $d_num = trim($dv_nums[$idx]);
-                $d_amt = floatval(str_replace(',', '', $dv_amts[$idx]));
-                $d_date = !empty($dv_dates[$idx]) ? $dv_dates[$idx] : null;
-                if ($ci_id) {
-                    $pdo->prepare("UPDATE charge_items SET dv_number=?, disbursed_amount=?, date_disbursed=? WHERE id=?")
-                        ->execute([$d_num, $d_amt, $d_date, $ci_id]);
-                }
-            }
-        }
-
-        $pdo->commit();
-        log_activity($pdo, $_SESSION['user_id'], $_SESSION['username'], 'UPDATE', "Updated PPA Ref: " . $trx_ref);
-        $success_msg = "Changes saved successfully." . $status_note;
-        
-        // Refresh Data
-        $stmt->execute([$id]); $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
-        $stmt_items->execute([$id]);
-        $charge_items = $stmt_items->fetchAll(PDO::FETCH_ASSOC);
-        $current_status = $base_data['status'];
-        $is_disbursing = ($current_status === 'disbursing' || $current_status === 'liquidated');
-        $is_liquidated = ($current_status === 'liquidated');
-        $plan_lock = ($is_disbursing || $is_viewer) ? 'readonly' : ''; 
-        $plan_select_class = ($is_disbursing || $is_viewer) ? 'locked-select bg-light' : '';
-        $add_row_hidden = ($is_disbursing || $is_viewer) ? 'display:none;' : '';
-        $actuals_lock = ($is_liquidated || $is_viewer) ? 'readonly' : '';
-
-    } catch (Exception $e) { $pdo->rollBack(); $error_msg = "Error: " . $e->getMessage(); }
+        } catch (Exception $e) { $pdo->rollBack(); $error_msg = "Error: " . $e->getMessage(); }
+    }
 }
 
 // ROUTING & PROCUREMENT BRIDGE
 if (isset($_POST['update_routing'])) {
-    $new_status = trim($_POST['status_routing']);
-    if (!empty($new_status)) {
-        $pdo->prepare("UPDATE obligations SET status_routing = ? WHERE id = ?")->execute([$new_status, $id]);
-        $pdo->prepare("INSERT INTO routing_history (obligation_id, user_name, status) VALUES (?, ?, ?)")->execute([$id, $_SESSION['username'], $new_status]);
-        $success_msg = "Routing movement recorded in Document Diary.";
-        $stmt->execute([$id]);
-        $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$can_edit) {
+        $error_msg = "Unauthorized: Viewer accounts cannot modify routing history.";
+    } else {
+        $new_status = trim($_POST['status_routing']);
+        if (!empty($new_status)) {
+            $pdo->prepare("UPDATE obligations SET status_routing = ? WHERE id = ?")->execute([$new_status, $id]);
+            $pdo->prepare("INSERT INTO routing_history (obligation_id, user_name, status) VALUES (?, ?, ?)")->execute([$id, $_SESSION['username'], $new_status]);
+            $success_msg = "Routing movement recorded in Document Diary.";
+            $stmt->execute([$id]);
+            $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
+        }
     }
 }
 
 // 18-STAGE PROCUREMENT FORWARD HANDLER
 if (isset($_POST['forward_procurement_stage'])) {
-    $stage_order  = (int)($_POST['stage_order'] ?? 0);
-    $proc_proj_id = (int)($_POST['procurement_project_id'] ?? 0);
-    $rel_date     = !empty($_POST['release_date']) ? $_POST['release_date'] : date('Y-m-d');
-    $rel_remarks  = trim($_POST['release_remarks'] ?? '');
-    $actor        = $_SESSION['username'] ?? 'ADMIN';
+    if (!$can_edit) {
+        $error_msg = "Unauthorized: Viewer accounts cannot advance procurement stages.";
+    } else {
+        $stage_order  = (int)($_POST['stage_order'] ?? 0);
+        $proc_proj_id = (int)($_POST['procurement_project_id'] ?? 0);
+        $rel_date     = !empty($_POST['release_date']) ? $_POST['release_date'] : date('Y-m-d');
+        $rel_remarks  = trim($_POST['release_remarks'] ?? '');
+        $actor        = $_SESSION['username'] ?? 'ADMIN';
 
-    if ($stage_order > 0 && $proc_proj_id > 0) {
-        $res = forward_procurement_stage_from_budget($pdo, (int)$id, $proc_proj_id, $stage_order, $rel_date, $rel_remarks, $actor);
-        if ($res['success']) {
-            $success_msg = $res['message'];
-            // Re-fetch base_data so status_routing and timestamps are fresh
-            $stmt->execute([$id]);
-            $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
-        } else {
-            $error_msg = $res['message'];
+        if ($stage_order > 0 && $proc_proj_id > 0) {
+            $res = forward_procurement_stage_from_budget($pdo, (int)$id, $proc_proj_id, $stage_order, $rel_date, $rel_remarks, $actor);
+            if ($res['success']) {
+                $success_msg = $res['message'];
+                // Re-fetch base_data so status_routing and timestamps are fresh
+                $stmt->execute([$id]);
+                $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
+            } else {
+                $error_msg = $res['message'];
+            }
         }
     }
 }
 
 // LINK PROCUREMENT TRACKING CODE
 if (isset($_POST['link_procurement_code'])) {
-    $manual_code = strtoupper(trim($_POST['manual_document_code'] ?? ''));
-    if (!empty($manual_code)) {
-        // Backend Guard: prevent linking if code is already bound to another obligation
-        $alreadyLinked = check_procurement_code_already_linked($pdo, $manual_code, (int)$id);
-        if ($alreadyLinked) {
-            $error_msg = "Double-Link Blocked: Procurement Code '{$manual_code}' is already linked to Obligation {$alreadyLinked['transaction_ref']} (#{$alreadyLinked['id']}: {$alreadyLinked['ppa_name']}). Each procurement project can only be linked to one obligation.";
-        } else {
-            // Backend Guard: check if project is DRAFT or CANCELLED in CHO Procurement
-            $procState = check_procurement_project_state($pdo, $manual_code);
-            if ($procState && $procState['status'] === 'CANCELLED') {
-                $error_msg = "Cannot link: Procurement Project {$manual_code} is CANCELLED in CHO Procurement.";
-            } elseif ($procState && (int)$procState['is_locked'] === 0) {
-                $error_msg = "Cannot link: Procurement Project {$manual_code} ({$procState['title']}) is currently in DRAFT status in CHO Procurement. It must be Finalized before linking.";
+    if (!$can_edit) {
+        $error_msg = "Unauthorized: Viewer accounts cannot link procurement codes.";
+    } else {
+        $manual_code = strtoupper(trim($_POST['manual_document_code'] ?? ''));
+        if (!empty($manual_code)) {
+            // Backend Guard: prevent linking if code is already bound to another obligation
+            $alreadyLinked = check_procurement_code_already_linked($pdo, $manual_code, (int)$id);
+            if ($alreadyLinked) {
+                $error_msg = "Double-Link Blocked: Procurement Code '{$manual_code}' is already linked to Obligation {$alreadyLinked['transaction_ref']} (#{$alreadyLinked['id']}: {$alreadyLinked['ppa_name']}). Each procurement project can only be linked to one obligation.";
             } else {
-                ensure_obligations_has_document_code_column($pdo);
-                $pdo->prepare("UPDATE obligations SET document_code = ? WHERE id = ?")->execute([$manual_code, $id]);
-                if (empty($base_data['status_routing'])) {
-                    $initRouting = "STAGE 1: SUBMISSION OF REQUISITION TO CHO\r\n\r\n" . $manual_code;
-                    $pdo->prepare("UPDATE obligations SET status_routing = ? WHERE id = ?")->execute([$initRouting, $id]);
+                // Backend Guard: check if project is DRAFT or CANCELLED in CHO Procurement
+                $procState = check_procurement_project_state($pdo, $manual_code);
+                if ($procState && $procState['status'] === 'CANCELLED') {
+                    $error_msg = "Cannot link: Procurement Project {$manual_code} is CANCELLED in CHO Procurement.";
+                } elseif ($procState && (int)$procState['is_locked'] === 0) {
+                    $error_msg = "Cannot link: Procurement Project {$manual_code} ({$procState['title']}) is currently in DRAFT status in CHO Procurement. It must be Finalized before linking.";
+                } else {
+                    ensure_obligations_has_document_code_column($pdo);
+                    $pdo->prepare("UPDATE obligations SET document_code = ? WHERE id = ?")->execute([$manual_code, $id]);
+                    if (empty($base_data['status_routing'])) {
+                        $initRouting = "STAGE 1: SUBMISSION OF REQUISITION TO CHO\r\n\r\n" . $manual_code;
+                        $pdo->prepare("UPDATE obligations SET status_routing = ? WHERE id = ?")->execute([$initRouting, $id]);
+                    }
+                    $success_msg = "Linked to Procurement Tracking Code: " . htmlspecialchars($manual_code);
+                    $stmt->execute([$id]);
+                    $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
                 }
-                $success_msg = "Linked to Procurement Tracking Code: " . htmlspecialchars($manual_code);
-                $stmt->execute([$id]);
-                $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
             }
         }
     }
@@ -322,17 +339,21 @@ if (isset($_POST['link_procurement_code'])) {
 
 // UNLINK PROCUREMENT TRACKING CODE
 if (isset($_POST['unlink_procurement_code'])) {
-    $actor = $_SESSION['username'] ?? 'admin';
-    $res = unlink_procurement_code_from_obligation($pdo, (int)$id, $actor);
-    if ($res['success']) {
-        $success_msg = $res['message'];
+    if (!$can_edit) {
+        $error_msg = "Unauthorized: Viewer accounts cannot unlink procurement codes.";
     } else {
-        $error_msg = $res['message'];
+        $actor = $_SESSION['username'] ?? 'admin';
+        $res = unlink_procurement_code_from_obligation($pdo, (int)$id, $actor);
+        if ($res['success']) {
+            $success_msg = $res['message'];
+        } else {
+            $error_msg = $res['message'];
+        }
+        // Re-fetch base_data cleanly
+        $stmt = $pdo->prepare("SELECT * FROM obligations WHERE id = ?");
+        $stmt->execute([$id]);
+        $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
     }
-    // Re-fetch base_data cleanly
-    $stmt = $pdo->prepare("SELECT * FROM obligations WHERE id = ?");
-    $stmt->execute([$id]);
-    $base_data = $stmt->fetch(PDO::FETCH_ASSOC);
 }
 
 $stmt_hist = $pdo->prepare("SELECT * FROM routing_history WHERE obligation_id = ? ORDER BY created_at DESC");
@@ -518,11 +539,13 @@ try {
                             <span class="badge font-monospace" style="background-color: #004253; color: #fff; font-size: 0.72rem;">
                                 <?= htmlspecialchars($proc_tracking['document_code']); ?>
                             </span>
+                            <?php if (!$is_viewer): ?>
                             <form method="POST" class="d-inline" onsubmit="return confirm('Are you sure you want to unlink <?= htmlspecialchars($proc_tracking['document_code']); ?> from this obligation?');">
                                 <button type="submit" name="unlink_procurement_code" class="btn btn-outline-danger btn-xs py-0 px-1.5" style="font-size: 0.65rem;" title="Unlink this procurement code">
                                     <i class="bi bi-x-circle me-1"></i>Unlink
                                 </button>
                             </form>
+                            <?php endif; ?>
                         </div>
                     <?php else: ?>
                         <span class="badge bg-secondary font-monospace" style="font-size: 0.72rem;">Unlinked</span>
@@ -589,7 +612,8 @@ try {
 
                         <!-- Forward / Release Action Form (for Admin / Authorized Staff) -->
                         <?php if (!$is_done && !$is_draft && !$is_cancelled): ?>
-                            <fieldset <?= $routing_lock; ?> class="border rounded p-3 bg-white mb-3 shadow-2xs">
+                            <?php if (!$is_viewer): ?>
+                            <fieldset class="border rounded p-3 bg-white mb-3 shadow-2xs">
                                 <legend class="float-none w-auto px-2 small fw-bold text-uppercase text-muted" style="font-size: 0.68rem;">
                                     <i class="bi bi-send-check text-success me-1"></i>Release &amp; Forward to Next Stage
                                 </legend>
@@ -612,6 +636,11 @@ try {
                                     </button>
                                 </form>
                             </fieldset>
+                            <?php else: ?>
+                            <div class="alert alert-light border small text-muted py-2 mb-3">
+                                <i class="bi bi-lock-fill me-1"></i> Stage forwarding is restricted to Encoders and Administrators.
+                            </div>
+                            <?php endif; ?>
                         <?php else: ?>
                             <div class="alert alert-success py-2 px-3 small fw-bold mb-3 d-flex align-items-center gap-2">
                                 <i class="bi bi-check-circle-fill text-success fs-5"></i>
@@ -688,6 +717,7 @@ try {
                         </div>
 
                     <?php else: ?>
+                        <?php if (!$is_viewer): ?>
                         <!-- Link Procurement Document Form -->
                         <div class="p-3 bg-light rounded border">
                             <div class="d-flex align-items-center gap-2 mb-2 pb-2 border-bottom">
@@ -746,12 +776,19 @@ try {
                                 <div id="edit_proc_preview" class="mt-2 text-start" style="display: none;"></div>
                             </form>
                         </div>
+                        <?php else: ?>
+                        <div class="p-3 bg-light rounded border text-muted small">
+                            <i class="bi bi-info-circle me-1"></i> No procurement document is linked to this obligation. (Read-only)
+                        </div>
+                        <?php endif; ?>
                     <?php endif; ?>
                 </div>
             </div>
 
             <!-- ROUTING MANAGER & DOCUMENT DIARY (PRESERVED) -->
-            <div class="card shadow-sm border-0 mb-4"><div class="card-header bg-info text-white fw-bold"><i class="bi bi-signpost-split me-2"></i>Routing Manager</div><div class="card-body bg-white"><fieldset <?php echo $routing_lock; ?>><form method="POST"><div class="mb-3"><label class="form-label small fw-bold text-muted">Update Status</label><textarea name="status_routing" class="form-control border-info" rows="2"><?php echo htmlspecialchars($base_data['status_routing'] ?? ''); ?></textarea></div><button type="submit" name="update_routing" class="btn btn-info text-white fw-bold w-100"><i class="bi bi-send-check me-2"></i>Log Movement</button></form></fieldset></div></div>
+            <?php if (!$is_viewer): ?>
+            <div class="card shadow-sm border-0 mb-4"><div class="card-header bg-info text-white fw-bold"><i class="bi bi-signpost-split me-2"></i>Routing Manager</div><div class="card-body bg-white"><form method="POST"><div class="mb-3"><label class="form-label small fw-bold text-muted">Update Status</label><textarea name="status_routing" class="form-control border-info" rows="2"><?php echo htmlspecialchars($base_data['status_routing'] ?? ''); ?></textarea></div><button type="submit" name="update_routing" class="btn btn-info text-white fw-bold w-100"><i class="bi bi-send-check me-2"></i>Log Movement</button></form></div></div>
+            <?php endif; ?>
             <div class="card shadow-sm border-0"><div class="card-header bg-dark text-white fw-bold"><span><i class="bi bi-journal-text me-2"></i>Document Diary</span></div><div class="card-body p-0 overflow-auto" style="max-height: 400px;"><ul class="list-group list-group-flush small"><?php foreach($history as $log): ?><li class="list-group-item"><div class="d-flex justify-content-between"><span class="fw-bold text-primary"><?php echo date('M d, H:i', strtotime($log['created_at'])); ?></span></div><div class="mt-1"><?php echo htmlspecialchars($log['status']); ?></div><div class="text-end text-muted fst-italic" style="font-size: 0.75rem;">by <?php echo htmlspecialchars($log['user_name']); ?></div></li><?php endforeach; ?></ul></div></div>
         </div>
     </div>
@@ -895,6 +932,7 @@ try {
 let availableItems = [];
 const existingItems = <?php echo json_encode($charge_items); ?>;
 const isDisbursing = <?php echo $is_disbursing ? 'true' : 'false'; ?>;
+const isViewer = <?php echo $is_viewer ? 'true' : 'false'; ?>;
 const trxRef = "<?php echo $trx_ref ? $trx_ref : 'LEGACY-'.$id; ?>";
 
 function loadData() {
@@ -934,7 +972,17 @@ function addItemRow(amount = '', selectedBucketId = '', rowId = '') {
         let disp = i.ppa_name ? `[${i.ppa_name}] ${i.name}` : i.name;
         options += `<option value="${i.id}" ${sel}>${disp}</option>`;
     });
-    const html = `<div class="row g-2 mb-2 align-items-center item-row"><input type="hidden" name="item_ids[]" value="${rowId}"><div class="col-md-8"><select name="bucket_ids[]" class="form-select form-select-sm fw-bold border-secondary item-select ${isDisbursing?'locked-select':''}" onchange="validateLocks()">${options}</select></div><div class="col-md-3"><input type="text" name="amounts[]" class="form-control fw-bold text-success amount-input" value="${formatNum(amount)}" oninput="formatAmount(this); calculateTotal();" ${isDisbursing?'readonly':''}></div><div class="col-md-1 text-center"><button type="button" class="btn btn-link text-danger p-0" onclick="this.closest('.item-row').remove(); calculateTotal();"><i class="bi bi-x-circle-fill"></i></button></div></div>`;
+
+    const isLocked = isDisbursing || isViewer;
+    const selectAttrs = isLocked ? 'disabled' : '';
+    const selectClass = isLocked ? 'locked-select bg-light' : '';
+    const amountAttrs = isLocked ? 'readonly disabled' : '';
+    const amountClass = isLocked ? 'bg-light' : '';
+    const deleteBtn = isViewer 
+        ? `<button type="button" class="btn btn-link text-muted p-0" disabled style="opacity: 0.25; cursor: not-allowed; pointer-events: none;" title="Disabled for Viewer"><i class="bi bi-x-circle-fill"></i></button>`
+        : `<button type="button" class="btn btn-link text-danger p-0" onclick="this.closest('.item-row').remove(); calculateTotal();"><i class="bi bi-x-circle-fill"></i></button>`;
+
+    const html = `<div class="row g-2 mb-2 align-items-center item-row"><input type="hidden" name="item_ids[]" value="${rowId}"><div class="col-md-8"><select name="bucket_ids[]" class="form-select form-select-sm fw-bold border-secondary item-select ${selectClass}" onchange="validateLocks()" ${selectAttrs}>${options}</select></div><div class="col-md-3"><input type="text" name="amounts[]" class="form-control fw-bold text-success amount-input ${amountClass}" value="${formatNum(amount)}" oninput="formatAmount(this); calculateTotal();" ${amountAttrs}></div><div class="col-md-1 text-center">${deleteBtn}</div></div>`;
     document.getElementById('items_container').insertAdjacentHTML('beforeend', html);
 }
 
@@ -944,8 +992,8 @@ function validateLocks() {
     const warning = document.getElementById('lock_warning');
     let isLocked = false;
 
-    // Don't validate if already saved in Disbursing Mode (assume unlocked via approval)
-    if(isDisbursing) return;
+    // Don't validate if already saved in Disbursing Mode or for Viewer (assume locked/view-only)
+    if(isDisbursing || isViewer) return;
 
     document.querySelectorAll('.item-select').forEach(sel => {
         const item = availableItems.find(i => i.id == sel.value);

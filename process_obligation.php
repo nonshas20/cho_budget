@@ -1,6 +1,12 @@
 <?php
 // process_obligation.php
-require 'db_connect.php';
+if (session_status() === PHP_SESSION_NONE) { session_start(); }
+$user_role = strtolower($_SESSION['role'] ?? 'viewer');
+if (!in_array($user_role, ['admin', 'encoder'])) {
+    http_response_code(403);
+    die("<div style='color:red; font-family:sans-serif; padding:20px;'><h3>403 Forbidden</h3><p>Unauthorized: View-only accounts and unauthenticated users cannot encode obligations.</p><a href='view_obligations.php'>Back to Obligation Log</a></div>");
+}
+require 'includes/db_connect.php';
 
 // 1. Capture Form Data
 $bucket_id = $_POST['budget_bucket_id'];

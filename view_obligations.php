@@ -1,5 +1,7 @@
 <?php
 require 'includes/db_connect.php';
+require_once 'includes/procurement_bridge.php';
+ensure_obligations_has_document_code_column($pdo);
 
 if (session_status() === PHP_SESSION_NONE) { session_start(); }
 if (!isset($_SESSION['role'])) { header("Location: index.php"); exit; }
@@ -21,10 +23,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if (isset($_POST['cancel_id']) && $trx_ref) {
-        $stmt = $pdo->prepare("UPDATE obligations SET status = 'cancelled' WHERE transaction_ref = ?");
-        $stmt->execute([$trx_ref]);
-        $success_msg = "Transaction (Ref: $trx_ref) has been cancelled.";
-        log_activity($pdo, $_SESSION['user_id'], $_SESSION['username'], 'UPDATE', "Cancelled PPA Group $trx_ref");
+        if (!in_array(strtolower($_SESSION['role'] ?? 'viewer'), ['admin', 'encoder'])) {
+            $error_msg = "Unauthorized: Viewer accounts cannot cancel transactions.";
+        } else {
+            $stmt = $pdo->prepare("UPDATE obligations SET status = 'cancelled' WHERE transaction_ref = ?");
+            $stmt->execute([$trx_ref]);
+            $success_msg = "Transaction (Ref: $trx_ref) has been cancelled.";
+            log_activity($pdo, $_SESSION['user_id'], $_SESSION['username'], 'UPDATE', "Cancelled PPA Group $trx_ref");
+        }
     }
 
     if (isset($_POST['delete_id']) && $_SESSION['role'] === 'admin' && $trx_ref) {
@@ -53,6 +59,11 @@ $filter_line_item = $_GET['line_item_id'] ?? null;
 
 $where_clauses = ["YEAR(o.obligation_date) = ?"];
 $params = [$filter_year];
+
+// Dynamic safety check: Verify if document_code column is available in obligations
+$checkDocCodeCol = $pdo->query("SHOW COLUMNS FROM obligations LIKE 'document_code'")->fetch();
+$hasDocCode = !empty($checkDocCodeCol);
+$docCodeSelect = $hasDocCode ? "o.document_code" : "NULL as document_code";
 
 if (!empty($scan_ref)) {
     $where_clauses = ["o.transaction_ref LIKE ?"];
@@ -85,9 +96,15 @@ if (!empty($scan_ref)) {
 
     // 4. TEXT SEARCH
     if (!empty($search_text)) {
-        $where_clauses[] = "(o.ppa_name LIKE ? OR o.particulars LIKE ? OR li.name LIKE ? OR o.program_unit LIKE ? OR o.bonded_officer LIKE ? OR o.document_code LIKE ?)";
-        $p = "%$search_text%";
-        array_push($params, $p, $p, $p, $p, $p, $p);
+        if ($hasDocCode) {
+            $where_clauses[] = "(o.ppa_name LIKE ? OR o.particulars LIKE ? OR li.name LIKE ? OR o.program_unit LIKE ? OR o.bonded_officer LIKE ? OR o.document_code LIKE ?)";
+            $p = "%$search_text%";
+            array_push($params, $p, $p, $p, $p, $p, $p);
+        } else {
+            $where_clauses[] = "(o.ppa_name LIKE ? OR o.particulars LIKE ? OR li.name LIKE ? OR o.program_unit LIKE ? OR o.bonded_officer LIKE ?)";
+            $p = "%$search_text%";
+            array_push($params, $p, $p, $p, $p, $p);
+        }
     }
 }
 
@@ -95,7 +112,7 @@ $where_sql = implode(" AND ", $where_clauses);
 
 // Main Query with v2.2.0 Subquery Enhancement (Fixed column name to 'status')
 $sql = "SELECT 
-            o.id as obligation_id, o.transaction_ref, o.document_code, o.ppa_name, o.particulars, o.obligation_date, 
+            o.id as obligation_id, o.transaction_ref, $docCodeSelect, o.ppa_name, o.particulars, o.obligation_date, 
             o.charging_period, o.program_unit, o.bonded_officer, o.status,
             ci.amount as planned_amount, ci.disbursed_amount, ci.dv_number,
             li.name as item_name, li.id as item_id,
@@ -214,6 +231,12 @@ function getStatusBadge($status) {
 
 <div class="container-fluid mt-4 px-4">
 
+    <?php if (isset($_GET['error']) && $_GET['error'] === 'unauthorized'): ?>
+        <div class="alert alert-danger alert-dismissible fade show no-print"><i class="bi bi-shield-lock-fill me-2"></i>Access Denied: Your account role does not have permission to encode obligations.<button type="button" class="btn-close" data-bs-dismiss="alert"></button></div>
+    <?php endif; ?>
+    <?php if (!empty($error_msg)): ?>
+        <div class="alert alert-danger alert-dismissible fade show no-print"><i class="bi bi-exclamation-triangle-fill me-2"></i><?php echo htmlspecialchars($error_msg); ?><button type="button" class="btn-close" data-bs-dismiss="alert"></button></div>
+    <?php endif; ?>
     <?php if (isset($success_msg)): ?><div class="alert alert-success alert-dismissible fade show no-print"><i class="bi bi-check-circle-fill me-2"></i><?php echo $success_msg; ?><button type="button" class="btn-close" data-bs-dismiss="alert"></button></div><?php endif; ?>
 
     <div class="d-flex justify-content-between align-items-center mb-3 no-print">
@@ -225,7 +248,9 @@ function getStatusBadge($status) {
             <button onclick="window.print()" class="btn btn-outline-dark fw-bold shadow-sm" title="Print Log to PDF or Printer">
                 <i class="bi bi-printer-fill me-1"></i> Print / PDF
             </button>
+            <?php if (strtolower($_SESSION['role'] ?? 'viewer') !== 'viewer'): ?>
             <a href="create_obligation.php" class="btn btn-success fw-bold shadow-sm"><i class="bi bi-plus-circle me-1"></i> New Obligation</a>
+            <?php endif; ?>
         </div>
     </div>
 
@@ -299,10 +324,10 @@ function getStatusBadge($status) {
                         <tr>
                             <th class="print-hide-col" style="width: 3%"></th> 
                             <th style="width: 8%">Ref No.</th> 
-                            <th style="width: 25%" class="text-start">PPA Name / Particulars</th>
+                            <th style="width: 30%" class="text-start">PPA Name / Particulars</th>
                             <th style="width: 6%">Target Date</th>
                             <th style="width: 5%">Period</th>
-                            <th style="width: 12%" class="text-start">Unit / Officer</th>
+                            <th style="width: 7%" class="text-start">Unit / Officer</th>
                             <th style="width: 12%">Amount</th> <th style="width: 17%" class="text-start">Latest Diary Log</th> 
                             <th style="width: 6%">Status</th>
                             <th class="print-hide-col" style="width: 6%">Actions</th>
@@ -326,7 +351,7 @@ function getStatusBadge($status) {
                                     <td class="text-center font-monospace fw-bold text-primary">
                                         <?php echo htmlspecialchars($grp['ref']); ?>
                                         <?php if (!empty($grp['document_code'])): ?>
-                                            <div class="mt-1"><span class="badge bg-light text-success border font-monospace" style="font-size: 0.65rem;" title="Linked Procurement Tracking Code"><i class="bi bi-link-45deg me-0.5"></i><?php echo htmlspecialchars($grp['document_code']); ?></span></div>
+                                             <div class="mt-1"><span class="badge bg-light text-success border font-monospace" style="font-size: 0.65rem;" title="Linked Procurement Tracking Code"><i class="bi bi-link-45deg me-0.5"></i><?php echo htmlspecialchars($grp['document_code']); ?></span></div>
                                         <?php endif; ?>
                                     </td>
                                     <td>
@@ -340,9 +365,9 @@ function getStatusBadge($status) {
                                     <td class="text-center text-muted"><?php echo date('M d, Y', strtotime($grp['date'])); ?></td>
                                     <td class="text-center"><?php echo getPeriodBadge($grp['period']); ?></td>
                                     
-                                    <td class="text-muted small">
-                                        <?php if($grp['unit']): ?><div class="text-truncate" title="<?php echo htmlspecialchars($grp['unit']); ?>"><i class="bi bi-building"></i> <?php echo htmlspecialchars($grp['unit']); ?></div><?php endif; ?>
-                                        <?php if($grp['officer']): ?><div class="text-truncate mt-1" title="<?php echo htmlspecialchars($grp['officer']); ?>"><i class="bi bi-person-badge"></i> <?php echo htmlspecialchars($grp['officer']); ?></div><?php endif; ?>
+                                    <td class="text-muted small text-break">
+                                        <?php if($grp['unit']): ?><div class="lh-sm" title="<?php echo htmlspecialchars($grp['unit']); ?>"><i class="bi bi-building me-1"></i><?php echo htmlspecialchars($grp['unit']); ?></div><?php endif; ?>
+                                        <?php if($grp['officer']): ?><div class="lh-sm mt-1" title="<?php echo htmlspecialchars($grp['officer']); ?>"><i class="bi bi-person-badge me-1"></i><?php echo htmlspecialchars($grp['officer']); ?></div><?php endif; ?>
                                     </td>
                                     
                                     <td class="text-end fw-bold h6 mb-0 <?php echo $amount_color; ?>">
@@ -470,12 +495,14 @@ function getStatusBadge($status) {
         }
     });
 
+    <?php if (strtolower($_SESSION['role'] ?? 'viewer') !== 'viewer'): ?>
     document.addEventListener('keydown', function(event) { 
         if (event.altKey && event.key === 'n') { 
             event.preventDefault(); 
             window.location.href = 'create_obligation.php'; 
         } 
     });
+    <?php endif; ?>
 </script>
 
 <?php require 'includes/footer.php'; ?>

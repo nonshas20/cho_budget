@@ -1,8 +1,14 @@
 <?php
-// 1. START SESSION
+// 1. START SESSION & AUTHORIZATION CHECK
 if (session_status() === PHP_SESSION_NONE) { session_start(); }
 require 'includes/db_connect.php';
 require_once 'includes/procurement_bridge.php';
+
+$user_role = strtolower($_SESSION['role'] ?? 'viewer');
+if (!in_array($user_role, ['admin', 'encoder'])) {
+    header("Location: view_obligations.php?error=unauthorized");
+    exit;
+}
 
 // HELPER: Generate Acronym
 function getFundAcronym($name) {
@@ -37,6 +43,9 @@ require 'includes/header.php';
 // HANDLE SAVE
 if (isset($_POST['save_obligation'])) {
     try {
+        if (!in_array($user_role, ['admin', 'encoder'])) {
+            throw new Exception("Unauthorized: You do not have permission to encode obligations.");
+        }
         $pdo->beginTransaction();
 
         $year        = $_POST['fiscal_year']; 

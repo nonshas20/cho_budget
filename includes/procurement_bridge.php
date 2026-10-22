@@ -123,13 +123,31 @@ function ensure_obligations_has_document_code_column(PDO $pdo): void {
     static $checked = false;
     if ($checked) return;
     try {
-        $cols = $pdo->query("SHOW COLUMNS FROM cho_budget_db.obligations LIKE 'document_code'")->fetch();
+        $cols = $pdo->query("SHOW COLUMNS FROM obligations LIKE 'document_code'")->fetch();
         if (!$cols) {
-            $pdo->exec("ALTER TABLE cho_budget_db.obligations ADD COLUMN document_code VARCHAR(50) NULL AFTER obr_number, ADD INDEX idx_doc_code (document_code)");
+            $hasTrx = $pdo->query("SHOW COLUMNS FROM obligations LIKE 'transaction_ref'")->fetch();
+            $afterClause = $hasTrx ? "AFTER transaction_ref" : "";
+            $pdo->exec("ALTER TABLE obligations ADD COLUMN document_code VARCHAR(50) NULL $afterClause");
+            try {
+                $pdo->exec("ALTER TABLE obligations ADD INDEX idx_doc_code (document_code)");
+            } catch (\Throwable $e_idx) {}
         }
         $checked = true;
     } catch (\Throwable $e) {
-        // Silently continue if column already exists or restricted
+        try {
+            $cols = $pdo->query("SHOW COLUMNS FROM cho_budget_db.obligations LIKE 'document_code'")->fetch();
+            if (!$cols) {
+                $hasTrx = $pdo->query("SHOW COLUMNS FROM cho_budget_db.obligations LIKE 'transaction_ref'")->fetch();
+                $afterClause = $hasTrx ? "AFTER transaction_ref" : "";
+                $pdo->exec("ALTER TABLE cho_budget_db.obligations ADD COLUMN document_code VARCHAR(50) NULL $afterClause");
+                try {
+                    $pdo->exec("ALTER TABLE cho_budget_db.obligations ADD INDEX idx_doc_code (document_code)");
+                } catch (\Throwable $e_idx) {}
+            }
+            $checked = true;
+        } catch (\Throwable $e2) {
+            // Silently continue if column already exists or restricted
+        }
     }
 }
 
